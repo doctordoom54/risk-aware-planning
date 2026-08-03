@@ -1,0 +1,437 @@
+"""
+Risk-sensitive AO-RRT + SCP via time-consistent dynamic risk (CVaR).
+
+After Singh, Chow, Majumdar & Pavone, "A Framework for Time-Consistent,
+Risk-Sensitive Model Predictive Control: Theory and Algorithms" (arXiv:1703.01029).
+
+Idea
+----
+Replace the *expected* trajectory cost with a *coherent* one-step risk measure
+applied in a *nested* (time-consistent) way along the trajectory — a Markov dynamic
+risk measure. We use Conditional Value-at-Risk (CVaR), the canonical coherent
+measure, which has the dual representation
+
+        rho_alpha(Z) = max_{q in U_alpha} E_q[Z],
+        U_alpha = { q :  0 <= q(w) <= (1/alpha) p(w),  sum_w q(w) = 1 },
+
+so the risk evaluation is a convex program. The tail fraction `alpha in (0, 1]`
+sweeps the entire risk spectrum:
+
+        alpha = 1     ->  E[Z]          (risk-neutral)
+        alpha -> 0    ->  ess sup Z     (worst-case / robust).
+
+Equivalently (Rockafellar-Uryasev):
+
+        CVaR_alpha(Z) = min_t  t + (1/alpha) E[(Z - t)_+].
+
+Mapping to this planner
+-----------------------
+* Stochasticity = multiplicative wheel-slip noise on the skid-steer dynamics (the
+  paper's multiplicative-noise model): the applied torque is u * (1 + w), w ~ N(0, sigma).
+* Stage cost = terrain failure-probability from TerrainRiskMap (env.risk_*).
+
+* AO-RRT  (RiskSensitiveAORRT): each candidate edge is scored by the CVaR of an
+  ensemble of noisy rollouts. Because each edge's CVaR is added to the parent's
+  accumulated risk-cost, the cost along a tree path is a *nested* composition of
+  one-step CVaRs — exactly the time-consistent Markov dynamic risk measure.
+
+* SCP  (RiskSensitiveSCP): adds a convex CVaR penalty on the cumulative terrain
+  risk under sampled position-uncertainty scenarios, written as the Rockafellar-
+  Uryasev epigraph (auxiliary vars t, eta_s) so the sub-problem stays a QP. The
+  linearised stage risk  r_k = risk(p_k^prev) + grad_risk . (p_k - p_k^prev)  is
+  affine in the decision variables (exact autodiff gradient from env.risk_and_grad).
+
+Hard dependency: jax (shared with the dynamics). SCP additionally needs cvxpy.
+"""
+import math
+from functools import partial
+
+import numpy as np
+import jax.numpy as jnp
+from jax import jit, vmap, lax
+
+from .dynamics import _step, _noisy_step, NU
+from .dynamics_vel import _rollout, _ref_pose_vel, _batch_tracked_rollout
+from .environment import _sdf_value_only
+from .ao_rrt import AORRT
+#from .scp import SCPRefiner
+
+
+# ── stochastic obstacles: CVaR margin multiplier for a Gaussian boundary ──────
+def _ndtri(p):
+    """Inverse standard-normal CDF (Acklam's rational approximation, ~1e-9)."""
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p <= phigh:
+        q = p - 0.5; r = q * q
+        return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+               (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+    q = math.sqrt(-2 * math.log(1 - p))
+    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+           ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+
+
+def cvar_gaussian(alpha):
+    """CVaR (upper-tail fraction `alpha`) of a standard normal = phi(Phi^{-1}(1-alpha))/alpha.
+    This is the multiple of the boundary-uncertainty std by which a CVaR-risk-averse
+    plan inflates its obstacle keep-out margin:
+        alpha = 1   -> 0      (risk-neutral, keep nominal margin)
+        alpha = 0.5 -> 0.798
+        alpha = 0.1 -> 1.755
+        alpha -> 0  -> infinity (worst case; capped)."""
+    if alpha >= 1.0:
+        return 0.0
+    if alpha <= 1e-4:
+        return 5.0                                   # cap the worst-case inflation
+    z = _ndtri(1.0 - alpha)
+    return (math.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)) / alpha
+
+
+# ── CVaR estimators ───────────────────────────────────────────────────────────
+def cvar(z, alpha):
+    """Sample CVaR at tail fraction `alpha` (average of the worst alpha-fraction).
+    alpha=1 -> mean (risk-neutral); alpha->0 -> max (worst-case). Exact discrete
+    estimator (the weighted-dual form), identical to the minimum of the Rockafellar-
+    Uryasev epigraph  min_t t + (1/(alpha n)) sum (z_i - t)_+  that RiskSensitiveSCP
+    optimises -- so the AO-RRT and SCP risk evaluations are consistent."""
+    z = np.asarray(z, float).ravel()
+    n = z.size
+    if n == 0:
+        return 0.0
+    if alpha >= 1.0:
+        return float(z.mean())
+    if alpha <= 0.0:
+        return float(z.max())
+    z_desc = np.sort(z)[::-1]
+    return float(z_desc @ cvar_weights(n, alpha))
+
+
+def cvar_weights(n, alpha):
+    """Dual risk-envelope weights q* (length n) attaining CVaR for n EQUALLY-likely
+    samples, to be applied to costs sorted DESCENDING: full weight 1/(alpha n) on the
+    worst floor(alpha n), the remainder on the boundary sample, zero elsewhere
+    (q in U_alpha, sum q = 1). Reference/inspection; the planners use cvar()."""
+    w = np.zeros(n)
+    if alpha >= 1.0:
+        return np.full(n, 1.0 / n)
+    m = alpha * n
+    full = int(np.floor(m))
+    w[:full] = 1.0 / m                       # = 1 / (alpha n)
+    if full < n and m - full > 0:
+        w[full] = (m - full) / m             # remainder on the boundary sample
+    return w
+
+
+def _cvar_weights_full(n, alpha):
+    """cvar_weights(n, alpha), but also covering the alpha<=0 (worst-case) special
+    case that cvar() handles separately -- full weight on the single worst sample.
+    Used to precompute a FIXED weight vector once (n, alpha are static for a given
+    RiskSensitiveAORRT instance), so the per-edge fused kernel reduces to a plain
+    sort + dot product instead of re-deriving weights every call."""
+    if alpha <= 0.0:
+        w = np.zeros(n)
+        w[0] = 1.0
+        return w
+    return cvar_weights(n, alpha)
+
+
+# ── tracked-ensemble edge CVaR (obstacle closeness) ───────────────────────────
+def edge_tracking_cvar(env, Zens, alpha=0.05):
+    """CVaR_alpha of a tracked ensemble's worst-case obstacle PENETRATION over one
+    edge (tracking-deviation risk only). Obstacle BOUNDARY uncertainty is NOT a
+    separate bolted-on term here any more: when env is built with use_risk_sdf=True,
+    env.sdf itself already has each obstacle's keep-out inflated by
+    kappa(alpha) * s_k BEFORE the per-obstacle min (map.risk_sdf.build_risk_sdf), so
+    env.body_clearance_batch below already reflects boundary uncertainty -- this
+    function only has to do the ensemble-CVaR reduction on top of that field.
+
+    Zens: (M, T, >=2) tracked-ensemble trajectories (M members, T steps each, e.g.
+    the FULL closed-loop disturbance-grid ensemble from
+    VelPoseDynamics.tracked_ensemble -- every member, every step, no subsampling),
+    metres.
+
+    For each member, take the MIN body-surface clearance (env.body_clearance_batch
+    -- raw signed distance minus disc_radius, unclamped) over all T steps, i.e. its
+    single closest approach along the edge. Penetration is the HINGE of the negated
+    clearance, (-closest_per_traj)_+ -- zero for a member that stayed clear, positive
+    for one whose disc actually overlapped an obstacle. Applying the hinge PER
+    MEMBER before the CVaR guarantees CVaR_alpha(L) >= 0.
+
+    The result is divided by env.disc_radius, turning a metres-valued penetration
+    depth into a dimensionless "penetration in body-radii" -- so it's on a comparable
+    scale to the (also dimensionless, [0,1]-ish) control-effort cost term, letting the
+    two be combined with a normalized weight simplex (RiskSensitiveAORRT.__init__)
+    instead of two raw physical quantities added with unrelated units.
+
+    Not wired into any planner cost by default -- see RiskParams.use_edge_cvar."""
+    clearance = env.body_clearance_batch(Zens)        # (M, T)
+    closest_per_traj = clearance.min(axis=1)            # (M,) worst point per member
+    penetration = np.maximum(0.0, -closest_per_traj)     # hinge: >=0, 0 = stayed clear
+    return cvar(penetration, alpha) / env.disc_radius
+
+
+# ── multiplicative-noise (wheel-slip) ensemble rollout, JAX ───────────────────
+@jit
+def _noisy_rollout(x0, u, noise, dt, p):
+    """Roll out constant control `u` for len(noise) RK4 steps under multiplicative
+    slip dynamics noise: step k uses noise[k]. Returns (T+1, NX)."""
+    def body(x, n_k):
+        xn = _noisy_step(x, u, dt, p, n_k)
+        return xn, xn
+    _, xs = lax.scan(body, x0, noise)
+    return jnp.concatenate([x0[None, :], xs], axis=0)
+
+# ensemble: vmap a noisy rollout over S independent noise sequences (S, T, 2)
+_batch_noisy = jit(vmap(_noisy_rollout, in_axes=(None, None, 0, None, None)))
+
+
+class RiskSensitiveAORRT(AORRT):
+    """AO-RRT whose edge cost is the nested one-step CVaR of an ensemble of noisy
+    rollouts plus terrain risk. With alpha=1 and risk_weight=0 it reduces exactly to
+    the deterministic AO-RRT."""
+
+    def __init__(self, env, cfg, start_xy, goal_xy, risk=None, start_heading=None):
+        super().__init__(env, cfg, start_xy, goal_xy, start_heading=start_heading)
+        r = risk if risk is not None else cfg.risk
+        self.alpha = r.alpha
+        self.n_samples = r.n_samples
+        self.slip_sigma = r.slip_sigma
+        self.slip_gain = r.slip_gain
+        self.risk_weight = r.risk_weight
+        self.rng = np.random.default_rng(r.seed)
+        # stochastic obstacles: the CVaR margin against the uncertain boundary is now
+        # baked directly into env.sdf itself, per obstacle (map.risk_sdf.build_risk_sdf,
+        # when the environment is built with use_risk_sdf=True) -- not added here as a
+        # uniform scalar margin. See edge_tracking_cvar().
+        # closed-loop tracked-ensemble obstacle-CVaR edge cost -- OFF by default so a
+        # run can be repeated with use_edge_cvar flipped for direct comparison.
+        # Toggle live: pl.use_edge_cvar = True/False between AORRT.plan() calls.
+        self.use_edge_cvar = r.use_edge_cvar
+        # Normalize the two edge-cost weights (control-effort self.w_u, CVaR-of-
+        # penetration edge_cvar_weight) onto a simplex (sum to 1): both underlying
+        # terms are now dimensionless (_edge_cost's per-axis v_max/w_max
+        # normalization; edge_tracking_cvar's disc_radius normalization), so each
+        # weight's SHARE of (w_u + edge_cvar_weight) is exactly its relative
+        # influence on total edge cost, rather than two raw scalars whose relative
+        # effect depended on unrelated physical units. cfg defaults keep w_control >
+        # edge_cvar_weight, so control effort dominates after normalization too.
+        w_sum = self.w_u + r.edge_cvar_weight
+        self.w_u = self.w_u / w_sum
+        self.edge_cvar_weight = r.edge_cvar_weight / w_sum
+        # FULL disturbance grid (every dist_grid_n**2 member, no subsampling) -- built
+        # once here since it only depends on cfg.risk, not on the edge being scored.
+        ax = np.linspace(-r.ax_dist_max, r.ax_dist_max, r.dist_grid_n)
+        yw = np.linspace(-r.yaw_dist_max, r.yaw_dist_max, r.dist_grid_n)
+        AX, YW = np.meshgrid(ax, yw)
+        self._D = np.stack([AX.ravel(), YW.ravel()], axis=1)
+        self._track_gain = r.track_gain
+        self._clip_lo = (r.ax_clip_lo, r.yaw_clip_lo)
+        self._clip_hi = (r.ax_clip_hi, r.yaw_clip_hi)
+        self._Kp = (r.kp_x, r.kp_y)
+        self._k_psi = r.k_psi
+        self._v_eps_speed = r.v_eps_speed
+        self._u_max = (self.v_max, self.w_max)   # same command bounds the planner itself samples within
+        self._edge_cvar_kernel = self._build_edge_cvar_kernel()
+
+    def _build_edge_cvar_kernel(self):
+        """Build ONE jitted closure -- rollout + closed-loop tracked ensemble + SDF
+        lookup (value-only) + hinge + CVaR reduction, all fused -- so scoring an edge
+        is a single on-device pipeline with ONE host round trip (the final scalar) per
+        call, instead of separate tracked_ensemble() / env.sdf_and_grad() / cvar()
+        calls each crossing the device boundary. Everything captured here (D, gains,
+        clip bounds, the sdf grid, cvar weights) is fixed for this planner instance,
+        so it's closed over as a jit constant rather than re-passed/re-derived per edge.
+        env.sdf_device is the ONLY obstacle-related field read here: when the
+        environment is built with use_risk_sdf=True, that field already has each
+        obstacle's keep-out inflated by kappa(alpha) * s_k baked in BEFORE the
+        per-obstacle min (map.risk_sdf.build_risk_sdf), so there's no separate sigma
+        lookup / CVaR-gaussian term to add on top any more. The returned L_cvar is
+        divided by disc_radius (dimensionless "penetration in body-radii"), matching
+        edge_tracking_cvar()'s normalization, so it combines with the (also
+        dimensionless) control-effort cost via the weight simplex in __init__ rather
+        than adding metres to an unrelated unit.
+        See edge_tracking_cvar() (module-level) for the unfused, easier-to-read
+        reference version of the same computation, used for offline/standalone checks."""
+        D_j = jnp.asarray(self._D, dtype=jnp.float64)
+        M = self._D.shape[0]
+        Kmat = self.model._gain_matrix(self._track_gain)
+        Kpmat = self.model._gain_matrix(self._Kp)
+        clip_lo_j = jnp.asarray(self._clip_lo, dtype=jnp.float64)
+        clip_hi_j = jnp.asarray(self._clip_hi, dtype=jnp.float64)
+        u_max_j = jnp.asarray(self._u_max, dtype=jnp.float64)
+        v_eps_sq = float(self._v_eps_speed)
+        k_psi = float(self._k_psi)
+        dt = float(self.dt)
+        p = self.model.p
+        phi_params = self.model.phi_params
+        sdf_dev = self.env.sdf_device
+        resolution = self.env.resolution
+        disc_radius = self.env.disc_radius
+        # world-frame lower-left corner of sdf_dev's cell [0,0] -- 0.0 for every
+        # synthetic Environment (no .origin attribute at all, since those maps are
+        # always built with world (0,0) at the grid origin); nonzero only for the
+        # PCD-derived hardware maps (hardwarexps/*.py's PCDRiskSDFEnv), whose real-
+        # world scan origin can legitimately land anywhere, including negative.
+        # Without this shift, cells = pts * resolution silently samples sdf_dev at
+        # the wrong location whenever env.origin != (0,0).
+        origin = jnp.asarray(getattr(self.env, "origin", 0.0), dtype=jnp.float64)
+        cvar_w_desc = jnp.asarray(_cvar_weights_full(M, self.alpha), dtype=jnp.float64)
+
+        @partial(jit, static_argnums=(2,))
+        def _kernel(x0, u_ref, nsteps):
+            Zref = _rollout(x0, u_ref, nsteps, dt, p, phi_params)
+            P_d, Theta_d, V_d_I = _ref_pose_vel(Zref)
+            Zens = _batch_tracked_rollout(x0, u_ref, P_d, Theta_d, V_d_I, dt, p,
+                                           phi_params, Kpmat, k_psi, v_eps_sq, Kmat,
+                                           D_j, clip_lo_j, clip_hi_j,
+                                           -u_max_j, u_max_j)              # (M, nsteps+1, 5)
+            T = nsteps + 1
+            pts = Zens[:, :, 0:2].reshape(-1, 2)
+            cells = (pts - origin) * resolution
+            sdf_vals = _sdf_value_only(sdf_dev, cells).reshape(M, T)
+            clearance = sdf_vals - disc_radius
+            closest_per_traj = clearance.min(axis=1)                       # (M,)
+            penetration = jnp.maximum(0.0, -closest_per_traj)               # hinge, >=0
+            sorted_desc = jnp.flip(jnp.sort(penetration))
+            L_cvar = jnp.dot(sorted_desc, cvar_w_desc) / disc_radius
+            return L_cvar
+
+        return _kernel
+
+    def _edge_risk(self, x0, u, nsteps):
+        """CVaR over the noisy-rollout ensemble of the added terrain-risk cost. The
+        slip std is TERRAIN-DEPENDENT: larger over rough/steep ground, so risky terrain
+        is also more uncertain and the CVaR tail (not just the mean) responds to it."""
+        if self.risk_weight <= 0 or self.env.risk is None: #it is run with None as default
+            return 0.0
+        S = self.n_samples
+        # nominal (noise-free) rollout gives the positions at which to read the local
+        # slip-driving terrain, so each step's slip std scales with that terrain.
+        Xnom = self.model.propagate(x0, u, nsteps, self.dt)       # (nsteps+1, NX)
+        scale = self.env.slip_scale(Xnom[:nsteps, 0:2], self.slip_gain)   # (nsteps,)
+        z = self.rng.normal(0.0, 1.0, size=(S, nsteps, NU))
+        noise = z * (self.slip_sigma * scale)[None, :, None]     # per-step slip std
+        ens = np.asarray(_batch_noisy(jnp.asarray(x0, dtype=jnp.float64),
+                                      jnp.asarray(u, dtype=jnp.float64),
+                                      jnp.asarray(noise), float(self.dt),
+                                      self.model.p))              # (S, nsteps+1, NX)
+        pts = ens[:, :, 0:2].reshape(-1, 2)
+        rv = self.env.risk_vals(pts).reshape(S, nsteps + 1)
+        z_cost = self.risk_weight * rv.sum(axis=1) * self.dt     # per-sample stage risk
+        return cvar(z_cost, self.alpha)
+
+    def _edge_tracking_cvar(self, x0, u, nsteps):
+        """CVaR_alpha of this edge's closed-loop tracked-ensemble obstacle penetration:
+        the FULL disturbance-grid ensemble (dist_grid_n**2 members, every step -- no
+        subsampling), via the fused on-device kernel built in __init__ (one host round
+        trip per call instead of separate tracked_ensemble/sdf_and_grad/cvar calls).
+        Obstacle-boundary uncertainty is already baked into env.sdf when the
+        environment is built with use_risk_sdf=True (see edge_tracking_cvar() /
+        RiskParams.use_edge_cvar) -- no separate term is added here."""
+        L_cvar = self._edge_cvar_kernel(jnp.asarray(x0, dtype=jnp.float64),
+                                         jnp.asarray(u, dtype=jnp.float64),
+                                         int(nsteps))
+        return float(L_cvar)
+
+    def _extend_cost(self, node, X, u, nsteps):
+        # base (nominal control/time) cost from AORRT, plus the nested one-step CVaR
+        # of the edge risk on top -- not re-derived here.
+        cost = super()._extend_cost(node, X, u, nsteps) + self._edge_risk(node.x, u, nsteps) #edge risk in not added
+        if self.use_edge_cvar:
+            cost += self.edge_cvar_weight * self._edge_tracking_cvar(node.x, u, nsteps)
+        return cost
+
+
+# class RiskSensitiveSCP(SCPRefiner):
+#     """SCP refiner with an added convex, TIME-CONSISTENT CVaR penalty on terrain risk.
+
+#     Two ingredients make this the paper's risk measure rather than a static penalty:
+
+#     1. Uncertainty is PROPAGATED THROUGH THE DYNAMICS. The multiplicative wheel-slip
+#        (u_eff = u*(1+w), w~N(0,slip^2 I)) injects a per-step process-noise covariance
+#        W_k = slip^2 * B_k diag(u_k^2) B_k^T, and the state covariance follows the
+#        Lyapunov recursion  Sigma_{k+1} = A_k Sigma_k A_k^T + W_k  (A_k, B_k the SCP
+#        linearisation). The position marginal Sigma_k^xy (+ a pos_sigma^2 localisation
+#        floor) GROWS along the trajectory, so later knots are treated as more uncertain.
+
+#     2. The risk is the NESTED (Markov / time-consistent) one-step CVaR:
+#            sum_k CVaR_alpha( stage_risk_k ),
+#        each stage written as its own Rockafellar-Uryasev epigraph (t_k, eta_{k,s}),
+#        NOT a single end-to-end CVaR. This is exactly the time-consistent dynamic risk
+#        measure of Singh/Chow/Majumdar/Pavone.
+
+#     Per stage k we sample S position scenarios delta_{k,s} ~ N(0, Sigma_k^xy) and
+#     linearise the stage risk  r_{k,s} = risk(p_k^prev + delta_{k,s})
+#     + grad_risk . (p_k - p_k^prev)  (exact autodiff gradient). All terms are affine in
+#     the decision variables, so the sub-problem stays a QP. With w_risk=0 it reduces
+#     exactly to the base SCP."""
+
+#     def __init__(self, env, cfg, risk=None):
+#         super().__init__(env, cfg)
+#         r = risk if risk is not None else cfg.risk
+#         self.alpha = r.alpha
+#         self.n_samples = r.n_samples
+#         self.slip_sigma = r.slip_sigma          # baseline dynamics noise std
+#         self.slip_gain = r.slip_gain            # terrain coupling of the slip std
+#         self.pos_sigma = r.pos_sigma            # localisation covariance floor (m)
+#         self.w_risk = r.w_risk
+#         self.rng = np.random.default_rng(r.seed)
+#         # stochastic obstacles: inflate the hard SDF keep-out margin by a CVaR multiple
+#         # of the boundary-uncertainty std, so risk-averse smoothing keeps more clearance.
+#         self.margin += cvar_gaussian(self.alpha) * env.obstacle_sigma_m
+
+#     def _propagate_cov_xy(self, Sprev, Uprev, hbar):
+#         """Position-marginal covariance Sigma_k^xy (+ localisation floor) at every
+#         knot, from the Lyapunov recursion through the SCP-linearised dynamics. The
+#         per-step process noise uses a TERRAIN-DEPENDENT slip std (larger over rough/
+#         steep ground), so uncertainty grows faster where the terrain is risky."""
+#         N = len(Sprev)
+#         A, B, _ = self.model.batch_jacobians(Sprev[:N - 1], Uprev[:N - 1], hbar)
+#         NX = A.shape[1]
+#         sig_k = self.slip_sigma * self.env.slip_scale(Sprev[:, 0:2], self.slip_gain)  # (N,)
+#         Sig = np.zeros((NX, NX))                 # Sigma_0 = 0 (start state known)
+#         floor = (self.pos_sigma ** 2) * np.eye(2)
+#         cov = [Sig[0:2, 0:2] + floor]
+#         for k in range(N - 1):
+#             Du2 = np.diag(np.asarray(Uprev[k], float) ** 2)
+#             Wk = (sig_k[k] ** 2) * (B[k] @ Du2 @ B[k].T)   # terrain-scaled slip noise
+#             Sig = A[k] @ Sig @ A[k].T + Wk
+#             cov.append(Sig[0:2, 0:2] + floor)
+#         return cov                               # list of N (2,2) covariances
+
+#     def _risk_terms(self, cp, Sv, Uv, Sprev, Uprev, hbar):
+#         if self.w_risk <= 0 or self.env.risk is None:
+#             return 0, []
+#         N = len(Sprev); S = self.n_samples
+#         P0 = np.asarray(Sprev[:, 0:2], float)                 # (N,2) linearisation pts
+#         cov = self._propagate_cov_xy(Sprev, Uprev, hbar)
+#         # sample S position scenarios per knot from the PROPAGATED covariance
+#         jit = (self.env.res_m ** 2) * 1e-3
+#         pts = np.empty((N, S, 2))
+#         for k in range(N):
+#             L = np.linalg.cholesky(cov[k] + jit * np.eye(2))
+#             pts[k] = P0[k] + self.rng.normal(size=(S, 2)) @ L.T
+#         RV, RG = self.env.risk_and_grad(pts.reshape(-1, 2))   # one batched autodiff call
+#         RV = RV.reshape(N, S); RG = RG.reshape(N, S, 2)
+#         # nested per-stage CVaR: one Rockafellar-Uryasev epigraph per knot
+#         t = cp.Variable(N)
+#         eta = cp.Variable((N, S), nonneg=True)
+#         cons = []
+#         for k in range(N):
+#             dpk = Sv[k, 0:2] - P0[k]
+#             # affine stage risk per scenario: RV[k,s] + RG[k,s] . dpk
+#             cons += [eta[k, :] >= RV[k, :] + RG[k] @ dpk - t[k]]
+#         # sum_k ( t_k + (1/(alpha S)) sum_s eta_{k,s} )  == sum_k CVaR_alpha(stage_k)
+#         obj = self.w_risk * (cp.sum(t) + (1.0 / (self.alpha * S)) * cp.sum(eta))
+#         return obj, cons

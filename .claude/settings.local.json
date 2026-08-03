@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip --version)",
+      "Bash(python -m pip show jax)",
+      "Bash(C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe -c \"import jax; print\\(jax.__version__\\)\")",
+      "Bash(C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe -c ' *)",
+      "Bash(ls -la \"C:\\\\Users\\\\skelkar37\\\\GT\\\\Research F26\\\\NN residual\\\\phi_params.npz\")",
+      "Read(//c/Users/skelkar37/GT/Research F26/NN residual/**)",
+      "Bash(cp \"C:\\\\Users\\\\skelkar37\\\\GT\\\\Research F26\\\\NN residual\\\\phi_params.npz\" \"c:\\\\Users\\\\skelkar37\\\\GT\\\\Research F26\\\\risk-aware-planning\\\\src\\\\phi_params.npz\" && ls -la \"c:\\\\Users\\\\skelkar37\\\\GT\\\\Research F26\\\\risk-aware-planning\\\\src\\\\phi_params.npz\")",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" main.py control 42 1500)",
+      "Bash(ls -la \"C:\\\\Users\\\\skelkar37\\\\GT\\\\Research F26\\\\NN residual\\\\\" 2>/dev/null)",
+      "Read(//c/Users/skelkar37/GT/Research F26/NN residual\" 2>/dev/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" montecarlo_run.py --densities 5 10 --seeds 2 --iters 500 --quiet)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" montecarlo_run.py --densities 5 --seeds 1 --iters 500 --quiet)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" replot_trial.py results/montecarlo_trials/5_L_0.npz)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" replot_trial.py)",
+      "Bash(echo \"---exit code: $?---\")",
+      "Bash(python replot_trial.py results/montecarlo_trials/5_L_0.npz)",
+      "Bash(where python *)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" replot_trial.py results/montecarlo_trials/10_C_1.npz)",
+      "Bash(\"C:/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" montecarlo_run.py)",
+      "Bash(\"/c/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" \"C:\\\\Users\\\\SKELKA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-skelkar37-GT-Research-F26-risk-aware-planning\\\\57ac44cd-9d26-4892-99b5-00730548367c\\\\scratchpad\\\\check_clip_engagement.py\")",
+      "Bash(\"/c/Users/skelkar37/AppData/Local/miniconda3/envs/motionplanning/python.exe\" main_risk.py --iters 150 --rocks 6 --hills 2 --obs-sigma-min 0.05 --obs-sigma-max 0.4 --alphas 1.0 --no-tree)",
+      "Bash(where conda *)",
+      "Bash(conda env *)",
+      "Bash(pip show *)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\skelkar37\\GT\\Research F26\\NN residual"
+    ]
+  }
+}

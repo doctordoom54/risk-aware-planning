@@ -1,0 +1,870 @@
+"""
+Risk-aware SCP refiner, built on VelPoseDynamics's closed-loop tracked ensemble
+(dynamics_vel.py) instead of the open-loop SkidSteer4W dynamics scp.py refines
+(dynamics.py). Built incrementally -- this is step 1: the edge risk VALUE
+R_{k,m}, as defined in the SCP formulation doc (Sec. "Risk Variables and
+Gradients"):
+
+    R_{k,m} = (1/beta) * log( sum_i exp(beta * RiskMap(x_{k,m}^(i))) )
+
+the LogSumExp aggregation of pointwise terrain risk -- env's fused TerrainRiskMap
+(map/risk_map.py), the "joint collision/failure probability"
+p_fail = 1-(1-r_slope)(1-r_rough)(1-r_obstacle), baked once offline and queried
+on-device via the same differentiable bilinear lookup the SDF uses -- along
+ensemble member m's CLOSED-LOOP TRACKED trajectory over edge k (dynamics_vel's
+_tracked_rollout: outer pose-feedback loop + inner model-inversion velocity
+tracker, absorbing a constant disturbance d_m on (dot(v_b), dot(omega))).
+
+K edges and M disturbance-grid scenarios are mutually independent, so both axes
+are vmapped -- one jitted call computes the whole R (K, M) grid for an AO-RRT
+solution at once. AO-RRT edges have DIFFERENT nsteps (5..max_prop_steps, sampled
+per edge during planning -- see ao_rrt.py's _Node / plan()), so the batch pads
+every edge's rollout to T = max(nsteps_k) RK4 steps and masks each edge's
+invalid tail (-inf before the logsumexp) rather than resampling onto a uniform
+grid -- this stays exactly faithful to the real AO-RRT solution's edge
+durations. The padded tail steps are still physically valid (constant u_k
+continued past the edge's real end), they're just excluded from the aggregate.
+
+g^s_{k,m} = dR/d(s_bar_k), g^u_{k,m} = dR/d(u_bar_k): exact total derivatives,
+via jax.value_and_grad on the same scalar R_{k,m} function (one reverse-mode
+pass gives both).
+
+Naming: (s_bar_k, u_bar_k) -- NOT (s_k, u_k) -- because these are always the
+CURRENT SCP outer-loop ANCHOR/linearization point (the doc's own bar notation:
+"variables evaluated at the current outer-loop iteration are denoted with a
+bar"), never a QP decision variable. Iteration 1's anchor is the AO-RRT
+solution (edges_from_chain); every iteration after, it's whatever the PREVIOUS
+QP solve accepted (mirrors scp.py's Sprev/Uprev, reassigned each accepted
+iterate -- see scp.py's refine() loop). EdgeRiskEvaluator.edge_risk/
+edge_risk_grad take plain (Z_bar, U_bar, nsteps_k) arrays, not an AO-RRT chain,
+specifically so they work the same way on every outer iteration, not just the
+first.
+
+EdgeJacobianEvaluator wraps VelPoseDynamics.batch_jacobians (dynamics_vel.py)
+the same way: A_k, B_k, f_k for every edge, honoring each edge's REAL nsteps_k
+(batch_jacobians itself needs one SHARED, static nsteps per call -- it can't
+mix edge lengths in one vmap; grouping by distinct nsteps_k reconciles that,
+see EdgeJacobianEvaluator's docstring). f_k = f_edge(s_bar_k, u_bar_k) exactly
+(VelPoseDynamics.batch_jacobians' third return value), so (A_k, B_k, f_k) are
+precisely the linearised-dynamics defect-constraint terms the doc's Sec. II
+needs:
+
+    s_{k+1} = f_edge(s_bar_k, u_bar_k) + A_k (s_k - s_bar_k)
+                                        + B_k (u_k - u_bar_k) + nu_k
+
+-- f_k the constant term, A_k/B_k the linear terms, (s_k, u_k) the QP's OWN
+decision variables, nu_k a QP slack.
+
+RiskAwareSCP assembles all of the above (EdgeRiskEvaluator + EdgeJacobianEvaluator
++ env.sdf_and_grad) into the actual CVXPY QP subproblem and the trust-region
+outer loop, per the SCP formulation doc's full Sec. 3 (Constraints I-VI). The
+CVXPY problem is built ONCE (cp.Parameter for everything that changes per
+iteration, DPP-compliant so re-solves skip canonicalization) and re-solved
+every outer iteration with updated Parameter values -- never rebuilt. Config:
+SCPVelParams (config.py) -- a fresh block, NOT shared with the old scp.py's
+SCPParams; alpha/risk_beta/w_risk/the disturbance grid still live in
+RiskParams and are read from there, not duplicated."""
+import numpy as np
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+from jax import jit, vmap
+import cvxpy as cp
+from collections import namedtuple
+from jax.scipy.special import logsumexp
+
+from .dynamics_vel import _rollout, _ref_pose_vel, _tracked_rollout
+from .environment import _bilin_cell
+from .risk_planner import cvar
+
+
+# ── single-edge, single-scenario risk (pure, scalar-output) ─────────────────────
+def _edge_tracked_risk(s_bar_k, u_bar_k, d_m, valid_mask, T, dt, p, phi_params,
+                        Kp, k_psi, v_eps_sq, K, clip_lo, clip_hi,
+                        u_clip_lo, u_clip_hi, risk_dev, resolution, beta, origin):
+    """R_{k,m}: LogSumExp of pointwise terrain risk along the closed-loop TRACKED
+    trajectory of edge k (T padded RK4 substeps) under disturbance scenario d_m,
+    LINEARIZED AT (evaluated starting from) the current SCP anchor (s_bar_k,
+    u_bar_k) -- never a QP decision variable, see module docstring. valid_mask
+    (T+1,) is True for substeps 0..nsteps_k (this edge's REAL duration); padded
+    tail substeps (nsteps_k < i <= T, only when this edge is shorter than the
+    batch's longest edge) are excluded from the LogSumExp via -inf rather than
+    by truncating the rollout itself -- the padded tail is still a physically
+    valid continuation (constant u_bar_k), it's just not part of this edge's
+    risk. origin is risk_dev's cell-[0,0] world position (0.0 for every
+    synthetic Environment -- see EdgeRiskEvaluator.__init__); without
+    subtracting it, cells silently samples risk_dev at the wrong location
+    whenever env.origin != (0,0), as it does for the PCD hardware maps."""
+    Zref = _rollout(s_bar_k, u_bar_k, T, dt, p, phi_params)
+    P_d, Theta_d, V_d_I = _ref_pose_vel(Zref)
+    Ztrk = _tracked_rollout(s_bar_k, u_bar_k, P_d, Theta_d, V_d_I, dt, p, phi_params,
+                             Kp, k_psi, v_eps_sq, K, d_m,
+                             clip_lo, clip_hi, u_clip_lo, u_clip_hi)   # (T+1, 5)
+    cells = (Ztrk[:, 0:2] - origin) * resolution
+    risk_vals = vmap(lambda c: _bilin_cell(risk_dev, c))(cells)        # (T+1,)
+    masked = jnp.where(valid_mask, beta * risk_vals, -jnp.inf)
+    return logsumexp(masked) / beta
+
+
+# signature: (s_bar_k, u_bar_k, d_m, valid_mask, T, dt, p, phi_params, Kp,
+#             k_psi, v_eps_sq, K, clip_lo, clip_hi, u_clip_lo, u_clip_hi,
+#             risk_dev, resolution, beta, origin)                     -- 20 args
+
+# ── batch over the M-scenario disturbance grid (one edge, d_m varies) ───────────
+_edge_risk_over_M = vmap(
+    _edge_tracked_risk,
+    in_axes=(None, None, 0, None, None, None, None, None,
+              None, None, None, None, None, None, None, None, None, None, None, None),
+)
+
+# ── batch again over the K AO-RRT edges (s_bar_k, u_bar_k, valid_mask vary; D shared) ───
+_batch_edge_risk = jit(
+    vmap(
+        _edge_risk_over_M,
+        in_axes=(0, 0, None, 0, None, None, None, None,
+                  None, None, None, None, None, None, None, None, None, None, None, None),
+    ),
+    static_argnums=(4,),
+)
+
+
+# ── g^s_{k,m} = dR/ds_k, g^u_{k,m} = dR/du_k -- exact total derivatives ─────────
+# jax.value_and_grad on the SAME scalar _edge_tracked_risk: ONE reverse-mode pass
+# through the whole closed-loop tracked rollout (outer pose-feedback loop, inner
+# model-inversion controller, RK4 substeps, NN residual, bilinear risk lookup,
+# LogSumExp) yields R_{k,m} AND both g^s_{k,m} (argnums=0) and g^u_{k,m}
+# (argnums=1) together -- see dynamics_vel.py's module docstring / the SCP doc's
+# "Implementation Note (JAX Auto-Differentiation)". Two separate jax.grad calls
+# would redo the shared backward sweep twice for no benefit; this is one.
+_edge_risk_val_grad = jax.value_and_grad(_edge_tracked_risk, argnums=(0, 1))
+
+# ── batch over the M-scenario disturbance grid (one edge, d_m varies) ───────────
+_edge_risk_grad_over_M = vmap(
+    _edge_risk_val_grad,
+    in_axes=(None, None, 0, None, None, None, None, None,
+              None, None, None, None, None, None, None, None, None, None, None, None),
+)
+
+# ── batch again over the K edges (s_bar_k, u_bar_k, valid_mask vary; D shared) ──
+# Output pytree per call: (R, (g_s, g_u)); vmap threads the K, M batch axes
+# through every leaf, so the final call returns R (K,M), g_s (K,M,5), g_u (K,M,2)
+# -- the whole doc's g^s_{k,m}, g^u_{k,m} grid, evaluated at every current SCP
+# anchor knot and every disturbance scenario, in one compiled, doubly-vmapped call.
+_batch_edge_risk_grad = jit(
+    vmap(
+        _edge_risk_grad_over_M,
+        in_axes=(0, 0, None, 0, None, None, None, None,
+                  None, None, None, None, None, None, None, None, None, None, None, None),
+    ),
+    static_argnums=(4,),
+)
+
+
+# ── host-side helpers ────────────────────────────────────────────────────────
+def _wrap_defect(resid):
+    """Wrap a (K,NX) dynamics-defect residual's heading column (index 2 -- state is
+    [x,y,theta,v_b,omega]) to its shortest angular equivalent, via the same
+    arctan2(sin,cos) idiom dynamics_vel._wrap_angle already uses for comparing two
+    independently-computed headings (there, the tracking controller's reference vs.
+    actual psi; here, a candidate/anchor knot's theta vs. a freshly recomputed
+    f_edge's theta). Needed because theta is never wrapped/normalized in the state
+    itself anywhere in this codebase (_step/_rollout/ao_rrt all leave it as a
+    continuously-accumulating real number) -- two independently-computed values for
+    "the same" heading can differ by a multiple of 2*pi without this. The other four
+    columns (x,y,v_b,omega) are not periodic and pass through unchanged."""
+    resid = np.array(resid, dtype=np.float64, copy=True)
+    resid[:, 2] = np.arctan2(np.sin(resid[:, 2]), np.cos(resid[:, 2]))
+    return resid
+
+
+def _gain_matrix(G):
+    """Normalize a scalar, (2,) diagonal, or (2,2) gain into a (2,2) matrix
+    (mirrors VelPoseDynamics._gain_matrix)."""
+    Gj = jnp.asarray(G, dtype=jnp.float64)
+    if Gj.ndim == 0:
+        return Gj * jnp.eye(2, dtype=jnp.float64)
+    if Gj.ndim == 1:
+        return jnp.diag(Gj)
+    return Gj
+
+
+def disturbance_grid(cfg):
+    """(M,2) grid of constant (dot(v_b), dot(omega)) disturbances, M = dist_grid_n**2 --
+    same construction as RiskSensitiveAORRT / main_test.py's _disturbance_grid."""
+    r = cfg.risk
+    ax = np.linspace(-r.ax_dist_max, r.ax_dist_max, r.dist_grid_n)
+    yw = np.linspace(-r.yaw_dist_max, r.yaw_dist_max, r.dist_grid_n)
+    AX, YW = np.meshgrid(ax, yw)
+    return np.stack([AX.ravel(), YW.ravel()], axis=1)
+
+
+def edges_from_chain(chain):
+    """Extract the K REAL AO-RRT tree edges from pl._chain(): the FULL knot
+    sequence S_bar (K+1,5) -- every node's state, INCLUDING the last one
+    (chain[-1].x) -- anchor controls U_bar (K,2), and each edge's actual RK4
+    substep count nsteps_k (K,), no resampling, exactly the tree's own edges.
+
+    S_bar is (K+1,5) because the SCP `s` variable and the SDF constraint need
+    every knot, not just edge-start states; EdgeRiskEvaluator/
+    EdgeJacobianEvaluator only need the first K rows (S_bar[:-1], one anchor
+    state per edge) -- callers slice that off themselves.
+
+    This is ONLY the source of the ITERATION-1 anchor -- every SCP outer
+    iteration after that, (S_bar, U_bar) is whatever the previous QP solve
+    accepted (see EdgeRiskEvaluator's docstring), not this function."""
+    S_bar = np.stack([nd.x for nd in chain], axis=0)
+    U_bar = np.stack([nd.u for nd in chain[1:]], axis=0)
+    nsteps_k = np.array([nd.nsteps for nd in chain[1:]], dtype=np.int64)
+    return S_bar, U_bar, nsteps_k
+
+
+class EdgeRiskEvaluator:
+    """Batched R_{k,m} evaluator against one environment's terrain-risk map:
+    builds the disturbance grid / gain matrices / risk raster once, then
+    edge_risk(Z_bar, U_bar, nsteps_k) / edge_risk_grad(...) run the whole
+    K x M LogSumExp risk grid (+ gradients) in one jitted call.
+
+    Takes plain (Z_bar, U_bar, nsteps_k) arrays -- the CURRENT SCP outer-loop
+    anchor (s_bar_k, u_bar_k) for every edge -- not an AO-RRT chain, so the
+    SAME evaluator instance is reused unchanged across every outer iteration:
+    iteration 1 seeds (Z_bar, U_bar) from edges_from_chain(pl._chain()); every
+    iteration after, the caller passes in whatever the previous QP solve
+    accepted (mirrors scp.py's Sprev/Uprev, reassigned each accepted iterate --
+    see scp.py's refine() loop). nsteps_k is fixed per edge across iterations
+    (only s_bar_k, u_bar_k move)."""
+
+    def __init__(self, env, cfg, model):
+        if env._risk_dev is None:
+            raise ValueError("env has no terrain risk map -- build it with "
+                              "make_map_env(..., with_risk=True)")
+        self.env = env
+        self.cfg = cfg
+        self.model = model
+        r = cfg.risk
+        self.D = disturbance_grid(cfg)
+        self.Kmat = _gain_matrix(r.track_gain)
+        self.Kpmat = _gain_matrix((r.kp_x, r.kp_y))
+        self.k_psi = float(r.k_psi)
+        self.v_eps_sq = float(r.v_eps_speed)
+        self.clip_lo = jnp.asarray((r.ax_clip_lo, r.yaw_clip_lo), dtype=jnp.float64)
+        self.clip_hi = jnp.asarray((r.ax_clip_hi, r.yaw_clip_hi), dtype=jnp.float64)
+        self.u_max = jnp.asarray((cfg.aorrt.v_max, cfg.aorrt.w_max), dtype=jnp.float64)
+        self.beta = float(r.risk_beta)
+        self.risk_dev = env._risk_dev
+        self.resolution = env.resolution
+        # risk_dev's cell-[0,0] world position -- 0.0 for every synthetic Environment
+        # (no .origin attribute; those maps always have world (0,0) at the grid
+        # origin), nonzero only for the PCD-derived hardware maps (hardwarexps/*.py's
+        # PCDRiskSDFEnv), whose real scan origin can legitimately be negative. See
+        # _edge_tracked_risk's docstring for why this must be subtracted before the
+        # bilinear lookup.
+        self.origin = jnp.asarray(getattr(env, "origin", 0.0), dtype=jnp.float64)
+
+    def _edge_args(self, Z_bar, U_bar, nsteps_k):
+        """Shared (Z_bar, U_bar, valid_mask, T, ...) positional-arg tuple for
+        both _batch_edge_risk and _batch_edge_risk_grad."""
+        nsteps_k = np.asarray(nsteps_k)
+        T = int(nsteps_k.max())
+        valid_mask = jnp.asarray(np.arange(T + 1)[None, :] <= nsteps_k[:, None])
+        return (jnp.asarray(Z_bar, dtype=jnp.float64),
+                jnp.asarray(U_bar, dtype=jnp.float64),
+                jnp.asarray(self.D, dtype=jnp.float64),
+                valid_mask, T, float(self.cfg.dyn.dt),
+                self.model.p, self.model.phi_params,
+                self.Kpmat, self.k_psi, self.v_eps_sq, self.Kmat,
+                self.clip_lo, self.clip_hi,
+                -self.u_max, self.u_max,
+                self.risk_dev, self.resolution, self.beta, self.origin)
+
+    def edge_risk(self, Z_bar, U_bar, nsteps_k):
+        """R (K, M): LogSumExp edge risk for every (edge, disturbance-scenario)
+        pair, linearized at the CURRENT anchor (Z_bar (K,5), U_bar (K,2) --
+        s_bar_k, u_bar_k for every edge; nsteps_k (K,) each edge's RK4 substep
+        count), against this evaluator's map. numpy in/out."""
+        R = _batch_edge_risk(*self._edge_args(Z_bar, U_bar, nsteps_k))
+        return np.asarray(R)
+
+    def edge_risk_grad(self, Z_bar, U_bar, nsteps_k):
+        """R (K,M), g_s (K,M,5), g_u (K,M,2): the edge risk AND its exact total
+        derivatives g^s_{k,m} = dR/d(s_bar_k), g^u_{k,m} = dR/d(u_bar_k), for
+        every (edge, disturbance-scenario) pair, evaluated at the CURRENT
+        anchor (Z_bar, U_bar, nsteps_k -- see edge_risk) -- ONE jitted,
+        doubly-vmapped reverse-mode call over all K edges and M disturbances
+        at once. numpy in/out."""
+        R, (g_s, g_u) = _batch_edge_risk_grad(*self._edge_args(Z_bar, U_bar, nsteps_k))
+        return np.asarray(R), np.asarray(g_s), np.asarray(g_u)
+
+
+class EdgeJacobianEvaluator:
+    """Batched A_k, B_k, f_k evaluator (VelPoseDynamics.batch_jacobians) across
+    the whole K-edge horizon, honoring each edge's REAL nsteps_k -- unlike
+    batch_jacobians itself, which needs one SHARED, static nsteps per call (it's
+    a jit static arg, so lax.scan's length has to be a single Python int for
+    the whole vmapped batch; it can't mix edge lengths in one call).
+
+    nsteps_k is STRUCTURAL, fixed by the AO-RRT tree -- SCP only ever moves the
+    continuous anchor (s_bar_k, u_bar_k), never the multiple-shooting
+    transcription itself (how many knots, how long each edge is). So edges are
+    grouped by their distinct nsteps_k value ONCE (cached on first call, reused
+    every iteration after -- the grouping never needs to be redone just because
+    Z_bar/U_bar moved), and every call is a gather -> one batch_jacobians call
+    per DISTINCT nsteps value -> scatter back to each edge's original slot --
+    never a per-K Python loop, and never K separate compiled calls. Number of
+    distinct groups is bounded by AORRTParams.max_prop_steps - min_prop_steps,
+    so total JIT-compile cost across an entire SCP run is "a handful of times",
+    amortized exactly like VelPoseDynamics._rollout's own nsteps static arg."""
+
+    def __init__(self, model, cfg):
+        self.model = model
+        self.dt = float(cfg.dyn.dt)
+        self._nsteps_k_cached = None
+        self._group_idx_cached = None
+
+    def _groups(self, nsteps_k):
+        nsteps_k = np.asarray(nsteps_k)
+        if (self._nsteps_k_cached is not None
+                and nsteps_k.shape == self._nsteps_k_cached.shape
+                and np.array_equal(nsteps_k, self._nsteps_k_cached)):
+            return self._group_idx_cached
+        group_idx = {int(ns): np.where(nsteps_k == ns)[0]
+                     for ns in np.unique(nsteps_k)}
+        self._nsteps_k_cached = nsteps_k
+        self._group_idx_cached = group_idx
+        return group_idx
+
+    def batch_jacobians(self, Z_bar, U_bar, nsteps_k):
+        """A (K,NX,NX), B (K,NX,NU), f (K,NX): VelPoseDynamics.batch_jacobians
+        applied per edge's REAL nsteps_k via grouped gather/scatter. f_k =
+        f_edge(s_bar_k, u_bar_k) exactly -- f_k/A_k/B_k are the defect-
+        constraint terms (module docstring); (Z_bar, U_bar) are the CURRENT
+        SCP anchor, same convention as EdgeRiskEvaluator. NX, NU are read off
+        Z_bar/U_bar's own shape (not hardcoded), so this stays correct if the
+        underlying dynamics model's state/control dimension ever changes.
+        numpy in/out."""
+        Z_bar = np.asarray(Z_bar, dtype=np.float64)
+        U_bar = np.asarray(U_bar, dtype=np.float64)
+        K, NX = Z_bar.shape
+        NU = U_bar.shape[1]
+        A = np.empty((K, NX, NX)); B = np.empty((K, NX, NU)); f = np.empty((K, NX))
+        for ns, idx in self._groups(nsteps_k).items():
+            A[idx], B[idx], f[idx] = self.model.batch_jacobians(
+                Z_bar[idx], U_bar[idx], ns, self.dt)
+        return A, B, f
+
+
+# ── the linearization bundle the QP consumes each outer iteration ───────────────
+LinData = namedtuple("LinData", ["R_bar", "g_s", "g_u", "A", "B", "f_val", "h_sdf", "grad_h"])
+
+
+class RiskAwareSCP:
+    """The outer SCP loop + CVXPY QP subproblem (formulation doc Sec. 2-4, in
+    full): builds EdgeRiskEvaluator + EdgeJacobianEvaluator once, re-linearizes
+    at the current anchor every outer iteration, and re-solves the SAME
+    DPP-compliant CVXPY problem (only cp.Parameter values change -- never
+    rebuilt) with a scp.py-style trust-region accept/reject loop: grow trust
+    and retry the SAME anchor on an infeasible solve; on a feasible solve,
+    ALSO reject (shrink trust, retry the SAME anchor) if the virtual-control
+    defect (nu_k, the dynamics-constraint slack) exceeds tol_defect -- a
+    "feasible" QP solution that only got there by faking the linearized
+    dynamics constraint is not a real trajectory and must never be advanced
+    to. Only once nu_k is small enough is the step actually accepted (anchor
+    advanced, trust shrunk). Stops when the accepted step size drops below
+    tol_step or max_iters is hit. No true-nonconvex ratio test yet
+    (SCPVelParams.rho_accept/rho_good are reserved for that future upgrade);
+    acceptance is "solver feasible AND dynamically consistent," one step
+    stricter than scp.py's refine() (which only checks solver feasibility)."""
+
+    NX, NU = 5, 2
+
+    # TESTING: True = current behavior (defect gate + rho both gate acceptance);
+    # False = defect gate skipped, rho is the ONLY accept/reject test. Flip back
+    # to True to revert to the pre-existing acceptance logic.
+    _DEFECT_GATE_ENABLED = False
+
+    # tuning constants for the true-defect gate / recovery rule / growth cap -- all
+    # scale off tol_defect/tr_max rather than adding new SCPVelParams fields (revisit
+    # as separately-tunable config if empirical tuning ever suggests these need to
+    # move independently of tol_defect):
+    _DEFECT_MARGIN_MULT = 5.0     # non-worsening gate: reject only if a candidate's
+                                    # true defect exceeds the anchor's OWN true defect
+                                    # by more than this many x tol_defect
+    _GROWTH_GAP_MULT = 5.0        # suppress trust growth on an otherwise-great-rho
+                                    # accept if the true-vs-linear defect gap exceeds
+                                    # this many x tol_defect (high local curvature)
+    _FUTILITY_TRUST_MULT = 3.0    # on reject, grow (not shrink) trust if it's already
+                                    # <= this many x the anchor's own true defect --
+                                    # shrinking can't help there (see _reject_trust_step)
+    _MAX_CONSECUTIVE_GROWS = 3    # cap on consecutive futility-triggered grows before
+                                    # falling back to the normal shrink-to-floor path
+
+    def __init__(self, env, cfg, model):
+        self.env = env
+        self.cfg = cfg
+        self.model = model
+        self.svp = cfg.scp_vel
+        self.risk_eval = EdgeRiskEvaluator(env, cfg, model)
+        self.jac_eval = EdgeJacobianEvaluator(model, cfg)
+        self._K = None
+        self._M = None
+
+    # ---- linearize at the current anchor -----------------------------------
+    def _linearize(self, S_bar, U_bar, nsteps_k):
+        """S_bar (K+1,NX) full knot sequence, U_bar (K,NU), nsteps_k (K,) ->
+        LinData. R_bar/g_s/g_u and A/B/f_val are both evaluated at the SAME K
+        edge-start anchors S_bar[:-1] (value/Jacobian consistency); h_sdf/
+        grad_h are evaluated at all K+1 knots (the SDF constraint touches
+        every node, not just edge starts)."""
+        S_edge = S_bar[:-1]
+        R_bar, g_s, g_u = self.risk_eval.edge_risk_grad(S_edge, U_bar, nsteps_k)
+        A, B, f_val = self.jac_eval.batch_jacobians(S_edge, U_bar, nsteps_k)
+        h_sdf, grad_h = self.env.sdf_and_grad(S_bar[:, 0:2])
+        return LinData(R_bar, g_s, g_u, A, B, f_val, h_sdf, grad_h)
+
+    # ---- exact (non-linearized) objective value, for the rho ratio test ----
+    def _true_cost(self, S, U, R, f_true, h_true, s_goal):
+        """effort + CVaR(risk) + terminal-L1 + arc-length + dynamics-defect +
+        SDF-slack, evaluated EXACTLY at (S, U) -- same weights/formula as
+        _build_qp's objective (Constraint II's vc and Constraint III's vc_sdf
+        both included), but computed directly in numpy instead of through CVXPY.
+        R (K,M) must be the TRUE edge risk at (S, U) (risk_eval.edge_risk, no
+        gradient/linearization); f_true (K,NX) must be the TRUE f_edge(s_k,u_k)
+        for every edge (EdgeJacobianEvaluator.batch_jacobians' 3rd return value)
+        -- NOT the QP's own nu_p/nu_m; h_true (K+1,) must be the TRUE sdf value
+        at every knot (env.sdf_and_grad's 1st return value) -- NOT the QP's own
+        sigma. Both f_true and h_true measure consistency against the real
+        model/environment, never against the stale linearization that produced
+        a candidate. effort/term/arc are already exact functions of (S, U) even
+        inside the QP, so only risk/defect/SDF-slack can differ between the
+        linear surrogate and the true cost. Used to compute both the
+        'predicted' decrease (S=S_bar, U=U_bar, R=lin.R_bar, f_true=lin.f_val,
+        h_true=lin.h_sdf -- all exact AT the anchor, since a Taylor expansion is
+        exact at its own expansion point) and the 'actual' decrease (S=Xs,
+        U=Us, R/f_true/h_true freshly recomputed) that the rho ratio test
+        compares."""
+        svp = self.svp
+        effort = svp.w_u * float(np.sum(svp.r_v * U[:, 0] ** 2 + svp.r_omega * U[:, 1] ** 2))
+        risk = self.cfg.risk.w_risk * float(sum(cvar(R[k], self.cfg.risk.alpha)
+                                                 for k in range(R.shape[0])))
+        term = svp.w_term * float(np.sum(np.abs(S[-1] - s_goal)))
+        arc = svp.w_arc * float(np.sum((S[1:, 0:2] - S[:-1, 0:2]) ** 2))
+        defect = svp.w_nu * float(np.sum(np.abs(_wrap_defect(f_true - S[1:]))))
+        # one-sided (relu, not abs): extra clearance beyond d_safe isn't penalized,
+        # only a genuine deficit is -- matches the QP's own sigma at its optimum
+        # (for a fixed candidate, optimal sigma = max(0, d_safe - h) exactly).
+        sdf_slack = svp.w_sdf * float(np.sum(np.maximum(0.0, svp.d_safe - h_true)))
+        return effort + risk + term + arc + defect + sdf_slack
+
+    # ---- build the CVXPY problem ONCE per (K, M) shape ----------------------
+    def _build_qp(self, K, M):
+        NX, NU = self.NX, self.NU
+        svp = self.svp
+
+        s = cp.Variable((K + 1, NX))
+        u = cp.Variable((K, NU))
+        tau = cp.Variable(K)
+        eta = cp.Variable((K, M), nonneg=True)
+        nu_p = cp.Variable((K, NX), nonneg=True)
+        nu_m = cp.Variable((K, NX), nonneg=True)
+        sTp = cp.Variable(NX, nonneg=True)
+        sTm = cp.Variable(NX, nonneg=True)
+        sigma = cp.Variable(K + 1, nonneg=True)
+
+        A_p = cp.Parameter((K, NX, NX))
+        B_p = cp.Parameter((K, NX, NU))
+        dconst_p = cp.Parameter((K, NX))
+        Gs_p = cp.Parameter((K, M, NX))
+        Gu_p = cp.Parameter((K, M, NU))
+        Rconst_p = cp.Parameter((K, M))
+        gh_p = cp.Parameter((K + 1, 2))
+        sdfrhs_p = cp.Parameter(K + 1)
+        sbar_p = cp.Parameter((K + 1, NX))
+        ubar_p = cp.Parameter((K, NU))
+        trusts_p = cp.Parameter(NX, nonneg=True)
+        trustu_p = cp.Parameter(NU, nonneg=True)
+        sstart_p = cp.Parameter(NX)
+        sgoal_p = cp.Parameter(NX)
+
+        # objective
+        effort = svp.w_u * cp.sum(svp.r_v * cp.square(u[:, 0])
+                                   + svp.r_omega * cp.square(u[:, 1]))
+        cvar = self.cfg.risk.w_risk * (cp.sum(tau)
+                                        + (1.0 / (self.cfg.risk.alpha * M)) * cp.sum(eta))
+        term = svp.w_term * cp.sum(sTp + sTm)
+        vc = svp.w_nu * cp.sum(nu_p + nu_m)
+        # SDF-slack exact penalty (Constraint III's own virtual buffer, mirroring
+        # nu_p/nu_m for Constraint II -- see SCPVelParams.w_sdf).
+        vc_sdf = svp.w_sdf * cp.sum(sigma)
+        # arc-length penalty: pure Variable quadratic (no Parameters involved), so
+        # it's trivially DPP-compliant on its own -- pulls consecutive knots toward
+        # the shortest evenly-spaced path, countering the fact that nothing else in
+        # this objective penalizes path length (see RiskAwareSCP module docstring).
+        arc = svp.w_arc * cp.sum_squares(s[1:, 0:2] - s[:-1, 0:2])
+        objective = cp.Minimize(effort + cvar + term + vc + vc_sdf + arc)
+
+        cons = []
+        # I. boundary
+        cons += [s[0] == sstart_p]
+        cons += [s[K] == sgoal_p + sTp - sTm]
+        # II. linearized dynamics + virtual control (per edge -- a DIFFERENT
+        # A_k/B_k matrix per k, so this can't be vectorized without a loop;
+        # matches scp.py's own per-knot constraint-building pattern)
+        for k in range(K):
+            cons += [s[k + 1] == dconst_p[k] + A_p[k] @ s[k] + B_p[k] @ u[k]
+                     + nu_p[k] - nu_m[k]]
+        # III. SDF collision keep-out, vectorized over all K+1 knots at once
+        # (elementwise Parameter*Variable, no per-k matrix -- no loop needed).
+        # sigma (nonneg, exact-penalty via vc_sdf above) is this constraint's own
+        # virtual buffer -- WITHOUT it, the zero-step point (s=S_bar) is only
+        # feasible here if the anchor's true clearance already met d_safe, which
+        # isn't guaranteed (a linearization remainder on this constraint, exactly
+        # analogous to why Constraint II needs nu_p/nu_m): a prior accepted
+        # iterate can satisfy the OLD linearized SDF constraint without truly
+        # satisfying h(Xs) >= d_safe, so next iteration's zero-step check can
+        # otherwise be outright QP-infeasible.
+        cons += [cp.sum(cp.multiply(gh_p, s[:, 0:2]), axis=1) >= sdfrhs_p - sigma]
+        # IV. control limits (fixed bounds, not Parameters -- never change)
+        cons += [u >= np.asarray(svp.u_min, dtype=np.float64)]
+        cons += [u <= np.asarray(svp.u_max, dtype=np.float64)]
+        # IV.5 workspace/map-boundary keep-in -- NOT in the formulation doc's
+        # constraint list, added because nothing else bounds a knot to the map:
+        # the SDF constraint (III) only pushes knots away from OBSTACLES, so in
+        # open space near a map edge (no nearby obstacle => ~zero SDF gradient
+        # pressure back toward the interior) the solver has nothing stopping it
+        # from pushing s[:,0:2] straight past the boundary -- reproduced
+        # directly (a knot reached x=6.38 against width=6.0). Same margin
+        # Environment.in_bounds already uses: [disc_radius, width-disc_radius],
+        # offset by the map's own world-frame lower-left corner -- 0.0 for every
+        # synthetic Environment (no .origin attribute, so getattr's default keeps
+        # this identical to the old un-offset bound there), nonzero only for the
+        # PCD hardware maps, whose world (0,0) is NOT the map's corner in general.
+        # Without this offset, a knot near the TRUE edge of a negative-origin map
+        # (e.g. a start/goal pose at world y=0, which can be well inside such a
+        # map) gets wrongly treated as out-of-bounds -- and since Constraint I
+        # hard-fixes s[0]/s[K] with no slack, that miscalibrated bound makes the
+        # QP infeasible at every trust size, not just an overly-tight one.
+        r = self.env.disc_radius
+        ox, oy = np.asarray(getattr(self.env, "origin", (0.0, 0.0)), dtype=np.float64)
+        cons += [s[:, 0] >= ox + r, s[:, 0] <= ox + self.env.width - r]
+        cons += [s[:, 1] >= oy + r, s[:, 1] <= oy + self.env.height - r]
+        # V. trust regions (per-state-dimension radii, broadcast over knots)
+        cons += [s <= sbar_p + trusts_p, s >= sbar_p - trusts_p]
+        cons += [u <= ubar_p + trustu_p, u >= ubar_p - trustu_p]
+        # VI. CVaR epigraph (per edge -- a DIFFERENT (M,NX)/(M,NU) gradient
+        # stack per k, so a loop over k too; vectorized over m within each k)
+        for k in range(K):
+            cons += [eta[k, :] >= Rconst_p[k] + Gs_p[k] @ s[k] + Gu_p[k] @ u[k] - tau[k]]
+
+        prob = cp.Problem(objective, cons)
+        assert prob.is_dpp(), "QP is not DPP-compliant -- re-solves would re-canonicalize"
+
+        self.s, self.u, self.tau, self.eta = s, u, tau, eta
+        self.nu_p, self.nu_m, self.sTp, self.sTm = nu_p, nu_m, sTp, sTm
+        self.sigma = sigma
+        self._A_p, self._B_p, self._dconst_p = A_p, B_p, dconst_p
+        self._Gs_p, self._Gu_p, self._Rconst_p = Gs_p, Gu_p, Rconst_p
+        self._gh_p, self._sdfrhs_p = gh_p, sdfrhs_p
+        self._sbar_p, self._ubar_p = sbar_p, ubar_p
+        self._trusts_p, self._trustu_p = trusts_p, trustu_p
+        self._sstart_p, self._sgoal_p = sstart_p, sgoal_p
+        self.prob = prob
+        self._K, self._M = K, M
+
+    # ---- fold Parameter x Parameter products into precomputed constants ----
+    def _update_params(self, S_bar, U_bar, lin, trust_s, trust_u, s_start, s_goal):
+        S_edge = S_bar[:-1]
+        d_const = lin.f_val - np.einsum('kij,kj->ki', lin.A, S_edge) \
+                             - np.einsum('kij,kj->ki', lin.B, U_bar)
+        r_const = lin.R_bar - np.einsum('kmi,ki->km', lin.g_s, S_edge) \
+                             - np.einsum('kmi,ki->km', lin.g_u, U_bar)
+        sdf_rhs = self.svp.d_safe - lin.h_sdf \
+                  + np.einsum('ki,ki->k', lin.grad_h, S_bar[:, 0:2])
+
+        self._A_p.value = lin.A
+        self._B_p.value = lin.B
+        self._dconst_p.value = d_const
+        self._Gs_p.value = lin.g_s
+        self._Gu_p.value = lin.g_u
+        self._Rconst_p.value = r_const
+        self._gh_p.value = lin.grad_h
+        self._sdfrhs_p.value = sdf_rhs
+        self._sbar_p.value = S_bar
+        self._ubar_p.value = U_bar
+        self._trusts_p.value = trust_s
+        self._trustu_p.value = trust_u
+        self._sstart_p.value = s_start
+        self._sgoal_p.value = s_goal
+
+    # ---- trust update for a rejected step (defect-gate or rho) ---------------
+    def _reject_trust_step(self, trust_s, trust_u, anchor_defect, consecutive_grows):
+        """Normally shrink on reject -- but if trust is already <= _FUTILITY_TRUST_MULT
+        x the anchor's OWN true defect, shrinking further is provably futile: that
+        residual is fixed at the anchor (f_val[k] vs S_bar[k+1]) independent of how
+        tightly s,u get boxed around it, so growing instead gives the QP room to find
+        a genuinely more self-consistent point. Capped at tr_max and at
+        _MAX_CONSECUTIVE_GROWS consecutive uses of this branch (tracked by the
+        caller's `consecutive_grows`, reset to 0 on any accept) so the recovery rule
+        can't itself run away if growing repeatedly doesn't produce an accept --
+        falls back to the normal shrink-to-floor path instead, same as before this
+        rule existed."""
+        futile = (trust_s.max() <= self._FUTILITY_TRUST_MULT * anchor_defect
+                  and consecutive_grows < self._MAX_CONSECUTIVE_GROWS)
+        if futile:
+            trust_s = np.minimum(trust_s * self.svp.tr_grow, self.svp.tr_max)
+            trust_u = np.minimum(trust_u * self.svp.tr_grow, self.svp.tr_max)
+            return trust_s, trust_u, consecutive_grows + 1
+        trust_s = np.maximum(trust_s * self.svp.tr_shrink, self.svp.tr_min)
+        trust_u = np.maximum(trust_u * self.svp.tr_shrink, self.svp.tr_min)
+        return trust_s, trust_u, consecutive_grows
+
+    # ---- the outer trust-region loop ----------------------------------------
+    def solve(self, chain, goal_xy, verbose=True):
+        """Refine an AO-RRT solution `chain` (pl._chain()) toward `goal_xy`
+        (m). Iteration 1's anchor is the AO-RRT plan (edges_from_chain);
+        S_bar[-1]'s non-position dimensions (heading, velocities) are carried
+        over as the terminal target too -- only [x,y] is overridden by
+        goal_xy -- since this problem has no independent target heading/speed
+        at the goal. Returns (S_bar, U_bar, info) -- the refined (K+1,NX)/
+        (K,NU) trajectory and a dict of solve diagnostics."""
+        S_bar, U_bar, nsteps_k = edges_from_chain(chain)
+        K = U_bar.shape[0]
+        M = self.risk_eval.D.shape[0]
+        if self._K != K or self._M != M:
+            self._build_qp(K, M)
+
+        s_start = S_bar[0].copy()
+        s_goal = S_bar[-1].copy()
+        s_goal[0:2] = np.asarray(goal_xy, dtype=np.float64)
+
+        trust_s = np.array(self.svp.tr_s_init, dtype=np.float64)
+        trust_u = np.array(self.svp.tr_u_init, dtype=np.float64)
+        u_min = np.asarray(self.svp.u_min, dtype=np.float64)
+        u_max = np.asarray(self.svp.u_max, dtype=np.float64)
+        # per-dimension scale for max_move (state = [x, y, theta, v, omega]): v and
+        # omega get normalized by their own bound (same idea _true_cost's `effort`
+        # term already uses, r_v ~ 1/v_max^2) so a 0.01 m/s velocity change and a
+        # 0.01 m position change don't count as equally "large" in the L2 norm below
+        # -- x, y, theta stay in raw units (meters/radians).
+        move_scale = np.array([1.0, 1.0, 1.0, u_max[0], u_max[1]])
+
+        iters = 0; error = np.inf; n_solves = 0; hist = []
+        n_defect_rejects = 0; defect_true = 0.0; defect_qp = 0.0; final_defect = 0.0
+        n_rho_rejects = 0; rho = 1.0
+        stop_reason = None; cost_converged = False; consecutive_grows = 0
+        # hard backstop, independent of `iters` (which only counts ACCEPTED steps --
+        # a run that never accepts anything, e.g. a trust-value cycle between an
+        # infeasible solve and a defect/rho reject, would otherwise spin forever):
+        # cap total solve attempts generously above what any healthy run needs.
+        max_solves = 20 * self.svp.max_iters
+        while (iters < self.svp.max_iters and error >= self.svp.tol_step
+               and not cost_converged and n_solves < max_solves):
+            lin = self._linearize(S_bar, U_bar, nsteps_k)
+            # the anchor's OWN true dynamics-defect: f_val is f_edge(S_bar[:-1],U_bar)
+            # exactly (batch_jacobians' 3rd return), so this is free -- no extra
+            # rollout needed. Computed BEFORE solving so it's available whether this
+            # iteration ends up infeasible, rejected, or accepted; defaults
+            # final_defect to it (the returned trajectory's consistency if this
+            # iteration doesn't change S_bar) and feeds the recovery rule below.
+            anchor_defect = float(np.max(np.abs(_wrap_defect(lin.f_val - S_bar[1:]))))
+            final_defect = anchor_defect
+            self._update_params(S_bar, U_bar, lin, trust_s, trust_u, s_start, s_goal)
+            try:
+                self.prob.solve(solver=self.svp.solver)
+            except Exception:
+                self.prob.solve()
+            n_solves += 1
+
+            if self.s.value is None:                      # infeasible -> grow, retry
+                trust_s_old = trust_s.copy()
+                trust_s = np.minimum(trust_s * self.svp.tr_grow, self.svp.tr_max)
+                trust_u = np.minimum(trust_u * self.svp.tr_grow, self.svp.tr_max)
+                if verbose:
+                    print(f"  SCP it {iters:2d}: INFEASIBLE ({self.prob.status}), "
+                          f"trust_s -> {trust_s.max():.3f}")
+                # give up only once growing genuinely changes nothing (already AT the
+                # ceiling, clipped) -- checking trust_s.max() >= tr_max right after
+                # growing (the old way) breaks BEFORE a solve is ever attempted AT the
+                # newly-grown value; comparing to the pre-update value guarantees one
+                # solve happens at the exact ceiling before declaring it hopeless.
+                if np.array_equal(trust_s, trust_s_old):
+                    stop_reason = "trust_ceiling_infeasible"
+                    break
+                continue
+
+            Xs = np.array(self.s.value)
+            Us = np.clip(np.array(self.u.value), u_min, u_max)
+
+            # TRUE dynamics-defect residual at the candidate -- f_edge(Xs[:-1],Us)
+            # recomputed FRESH via EdgeJacobianEvaluator.batch_jacobians, never the
+            # QP's own nu_p/nu_m (self-referential: any point the QP outputs looks
+            # consistent with the stale linearization that produced it, whether or
+            # not it's consistent with the real dynamics -- this is exactly what let
+            # a run get permanently stuck rejecting with a defect that GREW as trust
+            # shrank, which only makes sense if the inconsistency was baked into the
+            # anchor's own knots). defect_qp is kept purely as a logged diagnostic --
+            # the gap between it and defect_true is a free curvature probe.
+            _, _, f_true = self.jac_eval.batch_jacobians(Xs[:-1], Us, nsteps_k)
+            resid = _wrap_defect(f_true - Xs[1:])
+            defect_true = float(np.max(np.abs(resid)))
+            defect_qp = float(np.max(np.asarray(self.nu_p.value) + np.asarray(self.nu_m.value)))
+            # TRUE sdf value at the candidate -- fresh env.sdf_and_grad call, never
+            # the QP's own sigma (same self-referential concern as nu, one constraint
+            # over: Constraint III has no guarantee analogous to "zero-step is
+            # feasible" without this, see _build_qp's Constraint III comment).
+            h_true, _ = self.env.sdf_and_grad(Xs[:, 0:2])
+
+            # non-worsening defect gate: reject only if the candidate is MEANINGFULLY
+            # WORSE than the anchor already was -- not an absolute tol_defect
+            # threshold. tol_defect (~1e-4) is a CONVERGENCE tolerance; the true
+            # defect on any real step is an O(step^2) linearization remainder, easily
+            # 1e-3..1e-1 for a meaningful move over a curvy multi-substep edge, so an
+            # absolute gate at tol_defect would reject nearly every productive step,
+            # not just bad ones -- and would livelock against the recovery rule below
+            # (growing trust to escape a bad anchor just extrapolates the same stale
+            # linear model further, plausibly making the candidate's true defect
+            # WORSE, re-triggering the gate at a bigger trust, shrinking back, and
+            # growing again, forever). tol_defect stays a convergence criterion,
+            # checked once against the FINAL accepted anchor (see info below) -- rho
+            # (informed by _true_cost's own defect term) is what actually grades
+            # whether a large-but-improving defect is worth accepting here.
+            # TESTING: gate disabled -- flip _DEFECT_GATE_ENABLED back to True to
+            # restore it (rho-only acceptance below is otherwise unchanged).
+            if self._DEFECT_GATE_ENABLED and \
+                    defect_true > anchor_defect + self._DEFECT_MARGIN_MULT * self.svp.tol_defect:
+                n_defect_rejects += 1
+                trust_s_old = trust_s.copy()
+                trust_s, trust_u, consecutive_grows = self._reject_trust_step(
+                    trust_s, trust_u, anchor_defect, consecutive_grows)
+                if verbose:
+                    print(f"  SCP it {iters:2d}: REJECTED (defect_true={defect_true:.2e} "
+                          f"> anchor={anchor_defect:.2e}+margin, qp_nu={defect_qp:.2e}), "
+                          f"trust_s -> {trust_s.max():.3f}")
+                # give up only once the trust update (grow OR shrink -- whichever
+                # _reject_trust_step picked) genuinely changes nothing (already fully
+                # clipped); checking trust_s.max() <= tr_min right after the update
+                # (the old way) breaks BEFORE a solve is ever attempted AT the newly-
+                # reached floor value. Comparing to the pre-update value guarantees
+                # one solve happens there first, and doesn't cut off the recovery
+                # rule's ability to grow back out of the floor.
+                if np.array_equal(trust_s, trust_s_old):
+                    if verbose:
+                        print(f"  SCP: trust stuck with defect_true still "
+                              f"{defect_true:.2e} -- stopping")
+                    stop_reason = "trust_floor_defect"
+                    break
+                continue
+
+            # rho ratio test (SCvx-style): does the TRUE cost improve as much as the
+            # QP's own linear/convex model predicted? J_anchor uses lin.R_bar/lin.f_val,
+            # both exact AT the anchor (a Taylor expansion is exact at its own
+            # expansion point), so J_anchor is the true cost of the current anchor,
+            # not an approximation -- and prob.value is the QP's own predicted new
+            # cost. J_candidate recomputes risk (edge_risk, value only) AND the
+            # dynamics defect (f_true, already computed above) HONESTLY at (Xs, Us)
+            # instead of trusting the QP's linear g_s/g_u estimate or its own nu, so
+            # pred_decrease and act_decrease are on equal footing except for exactly
+            # the two things that were ever approximated: risk and defect.
+            J_anchor = self._true_cost(S_bar, U_bar, lin.R_bar, lin.f_val, lin.h_sdf, s_goal)
+            R_true = self.risk_eval.edge_risk(Xs[:-1], Us, nsteps_k)
+            J_candidate = self._true_cost(Xs, Us, R_true, f_true, h_true, s_goal)
+            pred_decrease = J_anchor - float(self.prob.value)
+            act_decrease = J_anchor - J_candidate
+            # pred_decrease is NOT guaranteed positive: the zero-step point (s=S_bar,
+            # u=U_bar) is only QP-feasible if the anchor's own true SDF clearance
+            # already met d_safe, which the sigma slack above now ALLOWS to be
+            # violated (at a cost) rather than forcing outright infeasibility --
+            # so a degenerate pred_decrease can genuinely happen. Previously this
+            # branch force-set rho=1.0 (auto-accept) whenever pred_decrease was
+            # tiny/negative, REGARDLESS of act_decrease's sign -- a real hole: a
+            # candidate that made the true cost WORSE could slip through exactly
+            # when the ratio test had the least information to catch it. Now:
+            # treat it as fine only if the true cost didn't also get meaningfully
+            # worse; otherwise reject via a sentinel rho below rho_accept.
+            if pred_decrease > 1e-9:
+                rho = act_decrease / pred_decrease
+            elif act_decrease >= -1e-9:
+                rho = 1.0
+            else:
+                rho = -1.0
+
+            if rho < self.svp.rho_accept:                  # poor agreement -> reject, retry
+                n_rho_rejects += 1
+                trust_s_old = trust_s.copy()
+                trust_s, trust_u, consecutive_grows = self._reject_trust_step(
+                    trust_s, trust_u, anchor_defect, consecutive_grows)
+                if verbose:
+                    print(f"  SCP it {iters:2d}: REJECTED (rho={rho:.3f} < "
+                          f"rho_accept={self.svp.rho_accept}), trust_s -> {trust_s.max():.3f}")
+                # see the analogous comment in the defect-reject branch above.
+                if np.array_equal(trust_s, trust_s_old):
+                    if verbose:
+                        print(f"  SCP: trust stuck with rho still {rho:.3f} -- stopping")
+                    stop_reason = "trust_floor_rho"
+                    break
+                continue
+
+            # accept: advance the anchor, reset the futility-grow counter, and adopt
+            # this candidate's own true defect as the new anchor's consistency.
+            # Great agreement (rho >= rho_good) grows trust for bigger future
+            # strides -- but only if the true-vs-linear defect gap is also small; a
+            # large gap means high local curvature (a direct probe of it), so even a
+            # great-rho step shouldn't compound trust on top of that region.
+            # Acceptable-but-not-great agreement (or a great rho with a large gap)
+            # leaves trust unchanged -- only a poor-rho/defect reject shrinks it now.
+            error = float(np.max(np.linalg.norm((Xs - S_bar) / move_scale, axis=1)))
+            S_bar, U_bar = Xs, Us
+            final_defect = defect_true
+            consecutive_grows = 0
+            if (rho >= self.svp.rho_good
+                    and (defect_true - defect_qp) <= self._GROWTH_GAP_MULT * self.svp.tol_defect):
+                trust_s = np.minimum(trust_s * self.svp.tr_grow, self.svp.tr_max)
+                trust_u = np.minimum(trust_u * self.svp.tr_grow, self.svp.tr_max)
+            iters += 1
+            # record the TRUE cost (J_candidate), not the QP's own linear-surrogate
+            # prob.value -- prob.value is only ever a valid predicted cost for the
+            # ONE solve that produced it (it depends on a linearization that's
+            # re-derived fresh every iteration), so a sequence of prob.value across
+            # iterations mixes optima of different surrogates and isn't guaranteed
+            # to be monotonic even now. J_candidate IS guaranteed non-increasing
+            # across accepted iterations: acceptance requires rho >= rho_accept > 0,
+            # and pred_decrease > 0 by construction (the zero-step point is always
+            # QP-feasible), so act_decrease = rho * pred_decrease > 0 whenever a step
+            # is accepted -- i.e. J_true strictly decreases at every accepted step.
+            hist.append(J_candidate)
+            # secondary convergence check: max_move can stay well above tol_step
+            # indefinitely even after the true cost has effectively flattened out
+            # (diminishing-returns tail of a genuine local optimum, not a stall --
+            # e.g. seed with K=114 edges: max_move was still 0.0024 at iteration 34,
+            # but cost deltas had shrunk to ~0.001/iter several iterations earlier).
+            # Catch that case via the true-cost trace itself instead of only the
+            # step-size trace.
+            if len(hist) >= 2 and abs(hist[-1] - hist[-2]) < self.svp.tol_cost:
+                cost_converged = True
+            if verbose:
+                print(f"  SCP it {iters:2d}: max_move={error:.4f}  "
+                      f"trust_s={trust_s.max():.3f}  cost={J_candidate:.4f}  "
+                      f"defect_true={defect_true:.2e}  defect_qp={defect_qp:.2e}  "
+                      f"rho={rho:.3f}")
+        else:
+            if error < self.svp.tol_step:
+                stop_reason = "tol_step"
+            elif cost_converged:
+                stop_reason = "tol_cost"
+            elif n_solves >= max_solves:
+                stop_reason = "max_solves_exhausted"
+                if verbose:
+                    print(f"  SCP: hit the {max_solves}-solve safety cap with zero "
+                          f"further progress -- stopping (likely a trust-value cycle; "
+                          f"see tr_grow/tr_shrink module comment)")
+            else:
+                stop_reason = "max_iters"
+
+        info = {"iters": iters, "n_solves": n_solves,
+                "converged": bool((error < self.svp.tol_step or cost_converged)
+                                   and final_defect <= self.svp.tol_defect),
+                "stop_reason": stop_reason,
+                "cost_history": hist,
+                "final_defect": final_defect,
+                "max_defect": defect_true, "defect_qp": defect_qp,
+                "n_defect_rejects": n_defect_rejects,
+                "rho": rho, "n_rho_rejects": n_rho_rejects}
+        return S_bar, U_bar, info

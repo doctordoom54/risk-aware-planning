@@ -1,0 +1,300 @@
+"""Configuration: four-wheel skid-steer rover, AO-RRT, and fast SCP."""
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DynParams:
+    """Leo Rover: 4-wheel skid-steer, independently-actuated in-hub DC motors.
+    Specs: Fictionlab Leo Rover docs (wheel d~130 mm, track 354 mm, max speed
+    ~0.4 m/s, max wheel torque 5.6 N*m, 73.2:1 gearbox). The first-order wheel
+    damping is set so v_max = r*torque_max/damping = 0.065*5.6/0.9 ~ 0.40 m/s."""
+    wheel_radius: float = 0.065     # 130 mm tire diameter
+    track_width: float = 0.354      # left-right wheel separation (m)
+    #wheel_inertia: float = 0.15
+    #wheel_damping: float = 0.9      # tuned to Leo's ~0.4 m/s top speed
+    #torque_max: float = 5.6         # max wheel torque (N*m); nominal 4.0 TODO delete them as not needed with PWM model
+    dt: float = 0.05                 # propagation / sampling time step (s)
+    alpha: float = 0.153   #TODO remove this redundant parameter          # PWM linear actuator model parameter
+    beta: float = 2.85     #TODO remove this redundant parameter         # PWM linear actuator model parameter
+
+    # Nominal linear velocity dynamics (first-order actuator model), used by
+    # VelPoseDynamics (dynamics_vel.py): A_n = diag(*a_diag), B_n = diag(*b_diag).
+    # Determined by system identification on rover response on rigid surfaces.
+    a_diag: tuple = (-2.7337, -2.5621)
+    b_diag: tuple = (2.6867, 2.6418)
+
+
+@dataclass
+class EnvParams:
+    # Leo-scale indoor/outdoor arena (Leo is small + slow, ~0.4 m/s)
+    width: float = 6.0
+    height: float = 6.0
+    resolution: float = 0.01
+    num_rocks: int = 4
+    disc_radius: float = 0.25       # Leo footprint 424x445 mm -> circumscribed disc
+    clearance: float = 0.0
+    # Rock obstacle size range (radius, metres); each rock's radius is drawn
+    # uniform(rock_radius_min, rock_radius_max) -- diameter is just 2x these.
+    rock_radius_min: float = 0.3
+    rock_radius_max: float = 0.7
+    # Obstacle boundary-uncertainty std (metres): EACH obstacle instance (rock/
+    # crater/wall) draws its own std uniform(obstacle_sigma_min, obstacle_sigma_max)
+    # rather than sharing one constant -- see map.sdf.ObstacleSigmaField. Drives both
+    # TerrainRiskMap's Gaussian obstacle-proximity halo and the CVaR obstacle-boundary
+    # term in risk_planner.edge_tracking_cvar.
+    obstacle_sigma_min: float = 0.01
+    obstacle_sigma_max: float = 0.1
+
+
+@dataclass
+class AORRTParams:
+    max_iterations: int = 6000
+    goal_bias: float = 0.10
+    goal_tol: float = 0.3
+    max_prop_steps: int = 20   # max fixed-dt steps per control-sampled edge (~2 s)
+    # cost to minimise:  "time"    -> J = sum dt          (minimum-time)
+    #                    "control" -> J = sum ||u||^2 dt  (minimum control effort)
+    #                    "both"    -> J = sum (1 + w*||u||^2) dt
+    cost_mode: str = "control"
+    w_control: float = 0.2    # control-effort weight (used by "control"/"both")
+    cost_weight: float = 0.3   # weight of the cost coordinate in the NN metric
+    candidate_k: int = 30      # ANN candidates per iteration
+    branch_k: int = 8          # controls propagated per iteration (JAX vmap batch);
+                               # all feasible children are added to the tree
+    # four-motor control sampling
+    turn_frac: float = 0.95     # turn torque as a fraction of forward torque
+    reverse_prob: float = 0.01
+    ind_frac: float = 0.3      # independent per-wheel torque (frac of torque_max)
+    v_max: float = 0.38          # max forward speed (m/s)
+    w_max: float = 0.65           # max yaw rate (rad/s)
+
+
+@dataclass
+class SCPParams:
+    goal_tol: float = 0.3
+    w_control: float = 1.0
+    w_goal: float = 20.0
+    terminal_slack_penalty: float = 1e4    # exact L1 terminal-reach penalty
+    risk_margin: float = 0.0
+    clearance_buffer: float = 0.0
+    # arc-length penalty: w_arc * sum_k ||p_{k+1}-p_k||^2 -- pulls the knots onto the
+    # shortest evenly-spaced path, so SCP unwinds loops/backtracks left in the seed.
+    w_arc: float = 20.0
+    # free final time: a single global timestep h (uniform dt) becomes a variable, so
+    # the trajectory can shrink its duration instead of "filling" a fixed horizon with
+    # a loop. Linearised via dstep/d(dt). Set False to keep the fixed seed dt.
+    free_time: bool = True
+    dt_min: float = 0.01
+    dt_max: float = 0.1
+    trust_h: float = 0.02                  # per-iterate trust on the timestep h (s)
+    # SCPpy-style trust region: shrink each accepted iterate, grow on infeasible,
+    # iterate until the trajectory change < tol (converged smooth solution).
+    # trust_x is kept near the obstacle scale so the linearised SDF keep-out stays
+    # valid (a too-large step could tunnel a knot through an obstacle).
+    trust_x: float = 1.0                   # initial state trust (m) ~ obstacle scale
+    trust_u: float = 8.0                   # initial control trust (N*m)
+    trust_grow: float = 2.0                # grow factor on an infeasible solve
+    trust_shrink: float = 0.5              # shrink factor each accepted iterate
+    trust_x_max: float = 4.0
+    trust_u_max: float = 40.0
+    trust_min: float = 0.05
+    iter_max: int = 40
+    tol: float = 0.02                      # convergence: max knot displacement (m)
+    solver: str = "OSQP"                   # QP solver (OSQP / PIQP)
+
+
+@dataclass
+class RiskParams:
+    """Time-consistent CVaR risk sensitivity (Singh/Chow/Majumdar/Pavone 2017).
+    The trajectory cost becomes a nested one-step CVaR rather than an expectation;
+    `alpha` is the CVaR tail fraction and tunes the full risk spectrum:
+        alpha = 1.0  -> expectation        (risk-neutral)
+        alpha -> 0   -> essential supremum (worst-case / robust)."""
+    alpha: float = 0.05      # CVaR tail fraction in (0, 1]
+    n_samples: int = 32  #TODO probably need to remove this redundant because no sampling now.         # ensemble (AO-RRT) / scenario (SCP) count
+    slip_sigma: float = 0.10   #TODO probably need to remove this redundant because no sampling now.  # baseline multiplicative wheel-slip noise std (AO-RRT
+                                # rollouts and the SCP dynamics-covariance propagation)
+    slip_gain: float = 1.5    #TODO probably need to remove this redundant because no sampling now.   # terrain coupling: local slip std is
+                                # slip_sigma * (1 + slip_gain * terrain[0,1]) so rough/
+                                # steep ground is BOTH costlier and more uncertain;
+                                # 0 = uniform slip everywhere
+    pos_sigma: float = 0.10     # localisation covariance floor (m) added to Sigma_k^xy
+    risk_weight: float = 5.0    # terrain-risk weight in the AO-RRT edge cost
+    w_risk: float = 50.0        # CVaR terrain-risk penalty weight in the SCP objective
+    seed: int = 0               # RNG seed for the disturbance ensemble
+
+    # ── closed-loop tracked-ensemble obstacle-CVaR edge cost (AO-RRT) ──────────
+    use_edge_cvar: bool = True # toggle per-run to compare with/without
+    # weight on CVaR_alpha(edge obstacle penetration), dimensionless (normalized by
+    # disc_radius -- see edge_tracking_cvar). RiskSensitiveAORRT.__init__ renormalizes
+    # this together with AORRTParams.w_control onto a simplex (sum to 1); kept smaller
+    # than w_control (0.02) here so control-effort dominates total edge cost after
+    # normalization (~0.667 control / ~0.333 cvar).
+    edge_cvar_weight: float = 10.0
+
+    # ── closed-loop obstacle-risk tracking ensemble (feedback-linearization) ──
+    # Injected constant disturbance on (dot(v_b), dot(omega)) = (ax_body, yaw_accel),
+    # absorbed by a tracking controller that inverts the known nominal+NN model
+    # (scale-only residual net, no y_mean term). Grid: dist_grid_n points per axis in
+    # [-ax_dist_max, ax_dist_max] x [-yaw_dist_max, yaw_dist_max] -> M = dist_grid_n**2.
+    ax_dist_max: float = 0.9   # change back to 0.39 , disturbance half-range on dot(v_b) (ax_body, m/s^2)
+    yaw_dist_max: float = 0.9  #change back to 0.235 disturbance half-range on dot(omega) (yaw accel, rad/s^2)
+    dist_grid_n: int = 10        # points per axis -> M = dist_grid_n**2 (25-point disturbance grid)
+    # Inner loop: model-inversion velocity tracking, u = D_eff^-1(vdot_ref - A_n@v_ref
+    # - K(v-v_ref)). Feeds off the OUTER loop's v_ref/vdot_ref below, not the raw
+    # open-loop nominal profile.
+    track_gain: float = 25.0     # K = diag(track_gain, track_gain), feedback-linearization tracking gain
+    # Outer loop: pose-feedback reference-velocity correction (Kanayama-style unicycle
+    # trajectory tracking) -- corrects v_ref using the ACTUAL position/heading error
+    # against the nominal (open-loop) reference trajectory. Without this, velocity-
+    # tracking error decays but POSITION error never does: integrating two different
+    # velocity histories over the same window never re-converges on its own.
+    kp_x: float = 1.0            # Kp = diag(kp_x, kp_y), position-error gain (1/s)
+    kp_y: float = 1.0
+    k_psi: float = 1.0           # heading-error gain (1/s)
+    v_eps_speed: float = 0.02    # m/s; compared as v_eps_speed**2 against ||v_ref_I||^2
+                                  # -- below this, psi_ref falls back to the nominal
+                                  # heading instead of atan2(near-zero vector).
+    # Hard clip on the DISTURBED path's (dot(v_b), dot(omega)) -- raw CSV-logged
+    # extremes of the real rover's response. Never applied to the reference rollout.
+    ax_clip_lo: float = -100.400 #edit back to -1.40
+    ax_clip_hi: float = 100.093 #edit back to 1.09
+    yaw_clip_lo: float = -200.488 #edit back to -2.488
+    yaw_clip_hi: float = 200.460  #edit back to 2.46
+
+    # ── SCP edge-risk LogSumExp aggregation (scp_vel.py) ───────────────────────
+    # R_{k,m} = (1/beta) log sum_i exp(beta * RiskMap(x_{k,m}^(i))) over one edge's
+    # closed-loop tracked substeps. Larger beta -> closer to max() (sharper, tracks
+    # the single riskiest substep); smaller beta -> smoother, closer to a mean.
+    risk_beta: float = 30.0
+
+
+@dataclass
+class RiskSDFParams:
+    """Config for map.risk_sdf.build_risk_sdf -- the offline, per-obstacle
+    risk-inflated signed distance field (standalone from TerrainRiskMap's Gaussian
+    halo; not yet wired into any planner). Boundary-uncertainty std s_k for each
+    obstacle is drawn from the SAME range as ObstacleSigmaField / TerrainRiskMap
+    (see EnvParams.obstacle_sigma_min/max) -- this module does not introduce a
+    second uncertainty range.
+    alpha          : CVaR tail fraction (same meaning as RiskParams.alpha); kappa =
+                     norm.pdf(norm.ppf(1-alpha))/alpha, the CVaR (superquantile) of
+                     a standard normal at this alpha -- see risk_sdf.build_risk_sdf.
+    d_max          : TSDF truncation distance (m); the baked field is clipped to
+                     [-d_max, d_max].
+    robot_radius   : disc-model robot radius (m); matches EnvParams.disc_radius.
+    sample_spacing : trajectory sample spacing (m) used by risk_sdf.collision_margin
+                     to rule out tunneling between discrete samples (1-Lipschitz field).
+    """
+
+    d_max: float = 6.0
+
+
+@dataclass
+class SCPVelParams:
+    """Config for scp_vel.py's risk-aware SCP loop (VelPoseDynamics + closed-loop
+    tracked-ensemble CVaR, EdgeRiskEvaluator/EdgeJacobianEvaluator) -- a fresh,
+    self-contained config block, NOT shared with the old scp.py/SCPParams (which
+    is scoped to the old SkidSteer4W refiner and will be purged). Only holds
+    fields that don't already exist elsewhere: alpha (CVaR level), risk_beta
+    (LogSumExp sharpness), w_risk, and the disturbance grid (dist_grid_n/
+    ax_dist_max/yaw_dist_max) all live in RiskParams already and are read from
+    there (cfg.risk.*), not duplicated here."""
+    # objective weights
+    w_u: float = 1.0        # control-effort weight
+    w_term: float = 1e4     # terminal-slack (exact L1) penalty weight
+    w_nu: float = 1e4       # virtual-control (exact L1) penalty weight -- large,
+                             # so the QP only uses nu_k when the defect truly can't
+                             # be met within the trust region (exact penalty method)
+    w_sdf: float = 1e4      # SDF-slack (exact, one-sided penalty) weight -- same
+                             # exact-penalty role as w_nu but for Constraint III
+                             # (the SDF keep-out): without this, the zero-step point
+                             # (s=S_bar, u=U_bar) is NOT guaranteed QP-feasible if the
+                             # anchor's own true clearance already dipped below
+                             # d_safe (a linearization remainder on Constraint III,
+                             # exactly analogous to the dynamics defect Constraint II
+                             # already has nu for) -- large so the QP only uses the
+                             # slack when a knot truly can't reach d_safe clearance
+                             # within the trust region
+    r_v: float = 1.0 / 0.38 ** 2      # diag(W_u) forward-speed weight ~ 1/v_max^2
+    r_omega: float = 1.0 / 1.0 ** 2   # diag(W_u) yaw-rate weight ~ 1/omega_max^2
+    # arc-length penalty: w_arc * sum_k ||p_{k+1}-p_k||^2 -- pulls the knots toward
+    # the shortest evenly-spaced path (same role as scp.py's w_arc), so risk-driven
+    # detours only happen when the CVaR reduction is actually worth the extra length,
+    # not "for free" (the objective otherwise has nothing discouraging a longer route).
+    w_arc: float = 3.0
+
+    # control bounds (2,) -- matches AORRTParams.v_max/w_max defaults
+    u_min: tuple = (-0.38, -1.0)
+    u_max: tuple = (0.38, 1.0)
+
+    # SDF clearance (m) -- signed distance required at every knot
+    d_safe: float = 0.25
+
+    # trust regions -- PER-STATE-DIMENSION radii (unlike scp.py's single scalar
+    # trust_x): [dx, dy, dtheta, dv_b, domega]
+    tr_s_init: tuple = (0.5, 0.5, 0.5, 0.1, 0.2)
+    tr_u_init: tuple = (0.1, 0.2)
+    tr_shrink: float = 0.5
+    tr_grow: float = 1.8      # NOT 1/tr_shrink (2.0) -- deliberately NOT the exact
+                                # reciprocal of tr_shrink. If grow*shrink == 1 exactly,
+                                # an infeasible-grow immediately followed by a
+                                # defect/rho-reject-shrink (or vice versa) returns
+                                # trust to the EXACT same float, and if the same two
+                                # outcomes keep recurring there (feasible-but-bad-
+                                # defect at the bigger value, infeasible at the
+                                # smaller one), solve() cycles between those two
+                                # trust values FOREVER -- S_bar/U_bar never changes
+                                # since neither branch ever accepts, and nothing caps
+                                # it (max_iters only counts accepted steps). Observed
+                                # in practice with the old grow=2.0/shrink=0.5 pair.
+                                # 1.8 breaks every such 2-cycle structurally.
+    tr_min: float = 0.001      # was 0.01 -- too coarse for sharp local terrain-risk
+                                # features: the rho ratio test (RiskAwareSCP.solve)
+                                # could stay permanently stuck rejecting at the old
+                                # floor (linear model still wrong even at the
+                                # smallest allowed step); 0.001 empirically lets it
+                                # find a trustworthy neighborhood and keep progressing
+    tr_max: float = 4.0
+
+    # ratio-test thresholds (now active -- see RiskAwareSCP.solve's rho computation:
+    # rho = true cost decrease / QP-predicted cost decrease. rho < rho_accept ->
+    # reject the step, shrink trust, retry; rho >= rho_good -> accept and grow
+    # trust; in between -> accept, trust unchanged.
+    rho_accept: float = 0.1
+    rho_good: float = 0.7
+
+    # convergence
+    tol_defect: float = 1e-2   # CONVERGENCE tolerance on the FINAL accepted anchor's
+                                # own true dynamics-defect (RiskAwareSCP.solve's
+                                # info["final_defect"]) -- NOT a per-candidate gate.
+                                # (Per-candidate accept/reject uses a non-worsening
+                                # check scaled off this value instead -- an absolute
+                                # gate at tol_defect would reject nearly every
+                                # productive step, since the true defect on any real
+                                # move is an O(step^2) linearization remainder, easily
+                                # 1e-3..1e-1, not 1e-4.)
+    tol_step: float = 1e-3     # max knot displacement between iterates (used now)
+    tol_cost: float = 1e-1     # now active (RiskAwareSCP.solve): if the true-cost
+                                # drop between two accepted iterations falls below
+                                # this, treat it as converged even if max_move is
+                                # still above tol_step -- max_move can stay
+                                # nontrivial for many iterations in a diminishing-
+                                # returns tail even once cost has essentially
+                                # flattened (observed on a K=114-edge case: cost
+                                # deltas shrank to ~1e-3 well before max_move did).
+                                # Was 1e-6, a placeholder never tuned against this
+                                # objective's actual scale (~1e2)
+    max_iters: int = 100
+    solver: str = "CLARABEL"
+
+
+@dataclass
+class PlannerConfig:
+    dyn: DynParams = field(default_factory=DynParams)
+    env: EnvParams = field(default_factory=EnvParams)
+    aorrt: AORRTParams = field(default_factory=AORRTParams)
+    scp: SCPParams = field(default_factory=SCPParams)
+    risk: RiskParams = field(default_factory=RiskParams)
+    scp_vel: SCPVelParams = field(default_factory=SCPVelParams)
+    risk_sdf: RiskSDFParams = field(default_factory=RiskSDFParams)
