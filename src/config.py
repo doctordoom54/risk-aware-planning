@@ -203,19 +203,21 @@ class SCPVelParams:
     # objective weights
     w_u: float = 1.0        # control-effort weight
     w_term: float = 1e4     # terminal-slack (exact L1) penalty weight
-    w_nu: float = 1e4       # virtual-control (exact L1) penalty weight -- large,
-                             # so the QP only uses nu_k when the defect truly can't
-                             # be met within the trust region (exact penalty method)
-    w_sdf: float = 1e4      # SDF-slack (exact, one-sided penalty) weight -- same
-                             # exact-penalty role as w_nu but for Constraint III
-                             # (the SDF keep-out): without this, the zero-step point
+    w_nu: float = 1e4       # dynamics-defect (exact L1) penalty weight -- NOT a QP
+                             # variable anymore (Constraint II is a hard equality,
+                             # no virtual control): only used by _true_cost's defect
+                             # term, feeding J_true/the rho ratio test and the
+                             # accept-side trust-growth gate
+    w_sdf: float = 1e4      # SDF-slack (exact, one-sided penalty) weight -- the
+                             # QP's own analogous role for Constraint III (the SDF
+                             # keep-out): without this, the zero-step point
                              # (s=S_bar, u=U_bar) is NOT guaranteed QP-feasible if the
                              # anchor's own true clearance already dipped below
-                             # d_safe (a linearization remainder on Constraint III,
-                             # exactly analogous to the dynamics defect Constraint II
-                             # already has nu for) -- large so the QP only uses the
-                             # slack when a knot truly can't reach d_safe clearance
-                             # within the trust region
+                             # d_safe (a linearization remainder on Constraint III).
+                             # Constraint II has no analogous QP-side cushion anymore
+                             # -- sigma is the only slack left of this kind -- large
+                             # so the QP only uses it when a knot truly can't reach
+                             # d_safe clearance within the trust region
     r_v: float = 1.0 / 0.38 ** 2      # diag(W_u) forward-speed weight ~ 1/v_max^2
     r_omega: float = 1.0 / 1.0 ** 2   # diag(W_u) yaw-rate weight ~ 1/omega_max^2
     # arc-length penalty: w_arc * sum_k ||p_{k+1}-p_k||^2 -- pulls the knots toward

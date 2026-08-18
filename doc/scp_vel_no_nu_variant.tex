@@ -1,0 +1,65 @@
+\subsection{Variant: SCP Without the Dynamics Virtual Control}
+\label{sec:no-nu-variant}
+
+The formulation above (Constraint II, Eq.~\eqref{eq:dyncon}) admits the linearized
+dynamics equality via a split virtual control $\nu^{+},\nu^{-}\in\Rn^{K\times5}_{\ge0}$,
+penalized in the objective at weight $w_\nu$, so the QP is feasible even when no
+point in the trust box \eqref{eq:trust-box} satisfies the linearized dynamics
+exactly. Dropping $\nu^{+},\nu^{-}$ instead makes Constraint II a \emph{hard}
+equality:
+\begin{equation}
+s_{k+1} = d_k + A_k s_k + B_k u_k, \qquad
+d_k = f_k - A_k \bar{s}_k - B_k \bar{u}_k,
+\label{eq:dyncon-nonu}
+\end{equation}
+with no compensating term in the objective. The decision-variable set loses
+$\nu^{+},\nu^{-}\in\Rn^{K\times5}_{\ge0}$ entirely, and Eq.~\eqref{eq:objective}
+loses its defect term:
+\begin{equation}
+\min\quad \underbrace{w_u \sum_{k} \|u_k\|_R^2}_{\text{effort}}
++ \underbrace{w_{\text{risk}} \sum_{k}\!\Big(\tau_k + \tfrac{1}{\alpha M}\!\sum_{m}\eta_{k,m}\Big)}_{\text{CVaR}}
++ \underbrace{w_{\text{term}}\mathbf{1}^\top(\sigma_T^{+}\!+\!\sigma_T^{-})}_{\text{terminal }\ell_1}
++ \underbrace{w_{\text{sdf}}\mathbf{1}^\top\sigma}_{\text{SDF buffer}}
++ \underbrace{w_{\text{arc}}\!\sum_{k}\|p_{k+1}\!-\!p_k\|_2^2}_{\text{arc length}}.
+\label{eq:objective-nonu}
+\end{equation}
+The SDF buffer $\sigma_k$ (Constraint III) is unaffected by this change, but
+it is now the \emph{only} exact-penalty slack left touching the linearized
+constraint set --- Constraint II no longer has a cushion of its own, so a
+trust box too tight for the current linearization to satisfy exactly makes
+the QP itself infeasible rather than absorbing the shortfall into $\nu^\pm$.
+That case already has a handler (Algorithm~\ref{alg:trust-region}, the
+\texttt{QP infeasible} branch, which grows the trust region and retries), but
+it now carries load that used to fall on $\nu^\pm$ instead.
+
+$J_{\text{true}}$ (Eq.~\eqref{eq:truecost}) is otherwise unchanged: it still
+carries the $w_\nu\sum_k\|\wrap(f_{\text{edge}}(s_k,u_k)-s_{k+1})\|_1$ defect
+term, since that measures the accepted candidate's deviation from the
+\emph{true nonlinear} dynamics, not the QP's own slack --- it never depended
+on $\nu^\pm$ existing as a QP variable. What changes is the comparison this
+term supports: previously $d_{\mathrm{qp}}$ (Eq.~\eqref{eq:qp-defect}) gave a
+QP-side reading of how much defect the linearization already anticipated, so
+Eq.~\eqref{eq:accept-grow-cond} could gate trust growth on the \emph{gap}
+between the true and linear-predicted defect. With $\nu^\pm$ gone there is no
+$d_{\mathrm{qp}}$ to read, so the per-iteration quantities reduce to
+\begin{equation}
+d_{\mathrm{anchor}} = \max_k \big\| \wrap\big(f_k(\bar s_k,\bar u_k) - \bar s_{k+1}\big) \big\|_\infty,
+\qquad
+d_{\mathrm{cand}} = \max_k \big\| \wrap\big(f_k( s_k, u_k) - s_{k+1}\big) \big\|_\infty,
+\label{eq:defects-nonu}
+\end{equation}
+and the accept-side growth condition falls back to the true candidate defect
+alone, no longer netted against what the linearization saw:
+\begin{equation}
+\mathrm{grow} \;=\;
+\big[\rho \ge \rho_{\mathrm{good}}\big] \;\wedge\;
+\big[d_{\mathrm{cand}} \le \kappa_g \tau_d\big].
+\label{eq:accept-grow-cond-nonu}
+\end{equation}
+Everything downstream of $d_{\mathrm{cand}}/d_{\mathrm{anchor}}$ --- the
+reject-side futility check (Eq.~\eqref{eq:futility}--\eqref{eq:reject-update}),
+termination (Eq.~\eqref{eq:loop-cond}--\eqref{eq:converged}), and $\rho$
+itself (Eq.~\eqref{eq:rho}) --- is unchanged, since none of it ever read
+$\nu^\pm$ directly. In the parameter table, $w_\nu$ is repurposed from "defect
+virtual-control exact-penalty weight" to "true dynamics-defect penalty weight
+(Eq.~\eqref{eq:truecost} only; no longer a QP variable)."

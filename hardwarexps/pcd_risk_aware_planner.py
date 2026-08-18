@@ -90,7 +90,7 @@ GOAL = (2.8, 3.4)
 #          (env.sdf_device / RiskSensitiveAORRT's CVaR kernel, env._risk_dev /
 #          RiskAwareSCP's EdgeRiskEvaluator are untouched by this flag either
 #          way), only the hard keep-out margin changes.
-USE_RISK_INFLATED_SDF = True
+USE_RISK_INFLATED_SDF = False
 
 # Set True (or pass "savecsv" on the command line) to write the SCP-refined
 # trajectory to results/. Off by default so exploratory runs don't pile up files.
@@ -260,7 +260,7 @@ def save_trajectory_csv(S_bar, nsteps_k, dt, out_path):
 def main():
     args = sys.argv[1:]
     nums = [int(a) for a in args if a.isdigit()]
-    seed = nums[0] if len(nums) > 0 else 104
+    seed = nums[0] if len(nums) > 0 else 101
     iters = nums[1] if len(nums) > 1 else 80000
     save_csv = SAVE_TRAJECTORY_CSV or ("savecsv" in args)
     plot_vel = PLOT_VEL_OMEGA or ("plotvel" in args)

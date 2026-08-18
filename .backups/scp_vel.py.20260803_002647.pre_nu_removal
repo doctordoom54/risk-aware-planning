@@ -50,12 +50,10 @@ precisely the linearised-dynamics defect-constraint terms the doc's Sec. II
 needs:
 
     s_{k+1} = f_edge(s_bar_k, u_bar_k) + A_k (s_k - s_bar_k)
-                                        + B_k (u_k - u_bar_k)
+                                        + B_k (u_k - u_bar_k) + nu_k
 
 -- f_k the constant term, A_k/B_k the linear terms, (s_k, u_k) the QP's OWN
-decision variables. This is a HARD equality (no virtual-control slack): the
-QP itself goes infeasible if no point in the trust box satisfies it exactly,
-handled by the outer loop's INFEASIBLE branch (grow trust, retry).
+decision variables, nu_k a QP slack.
 
 RiskAwareSCP assembles all of the above (EdgeRiskEvaluator + EdgeJacobianEvaluator
 + env.sdf_and_grad) into the actual CVXPY QP subproblem and the trust-region
@@ -391,7 +389,7 @@ class RiskAwareSCP:
                                     # true defect exceeds the anchor's OWN true defect
                                     # by more than this many x tol_defect
     _GROWTH_GAP_MULT = 5.0        # suppress trust growth on an otherwise-great-rho
-                                    # accept if the true candidate defect exceeds
+                                    # accept if the true-vs-linear defect gap exceeds
                                     # this many x tol_defect (high local curvature)
     _FUTILITY_TRUST_MULT = 3.0    # on reject, grow (not shrink) trust if it's already
                                     # <= this many x the anchor's own true defect --
@@ -423,38 +421,38 @@ class RiskAwareSCP:
         return LinData(R_bar, g_s, g_u, A, B, f_val, h_sdf, grad_h)
 
     # ---- exact (non-linearized) objective value, for the rho ratio test ----
-    def _true_cost(self, S, U, R, h_true, s_goal):
-        """effort + CVaR(risk) + terminal-L1 + arc-length + SDF-slack,
-        evaluated EXACTLY at (S, U) -- same weights/formula as _build_qp's
-        objective, term for term, computed directly in numpy instead of
-        through CVXPY. No dynamics-defect term: Constraint II is a hard
-        equality with no QP-side counterpart to compare it against (see
-        below), so folding a defect penalty in here would bias pred_decrease
-        against act_decrease -- dynamics consistency is policed separately,
-        by the defect gate (anchor_defect/defect_true) in solve(), not by
-        this cost/the rho test. R (K,M) must be the TRUE edge risk at (S, U)
-        (risk_eval.edge_risk, no gradient/linearization); h_true (K+1,) must
-        be the TRUE sdf value at every knot (env.sdf_and_grad's 1st return
-        value) -- NOT the QP's own sigma, which measures consistency against
-        the stale linearization that produced a candidate, not reality.
-        effort/term/arc are already exact functions of (S, U) even inside the
-        QP, so only risk/SDF-slack can differ between the linear surrogate
-        and the true cost. Used to compute both the
-        'predicted' decrease (S=S_bar, U=U_bar, R=lin.R_bar, h_true=lin.h_sdf
-        -- all exact AT the anchor, since a Taylor expansion is exact at its
-        own expansion point) and the 'actual' decrease (S=Xs, U=Us,
-        R/h_true freshly recomputed) that the rho ratio test compares."""
+    def _true_cost(self, S, U, R, f_true, h_true, s_goal):
+        """effort + CVaR(risk) + terminal-L1 + arc-length + dynamics-defect +
+        SDF-slack, evaluated EXACTLY at (S, U) -- same weights/formula as
+        _build_qp's objective (Constraint II's vc and Constraint III's vc_sdf
+        both included), but computed directly in numpy instead of through CVXPY.
+        R (K,M) must be the TRUE edge risk at (S, U) (risk_eval.edge_risk, no
+        gradient/linearization); f_true (K,NX) must be the TRUE f_edge(s_k,u_k)
+        for every edge (EdgeJacobianEvaluator.batch_jacobians' 3rd return value)
+        -- NOT the QP's own nu_p/nu_m; h_true (K+1,) must be the TRUE sdf value
+        at every knot (env.sdf_and_grad's 1st return value) -- NOT the QP's own
+        sigma. Both f_true and h_true measure consistency against the real
+        model/environment, never against the stale linearization that produced
+        a candidate. effort/term/arc are already exact functions of (S, U) even
+        inside the QP, so only risk/defect/SDF-slack can differ between the
+        linear surrogate and the true cost. Used to compute both the
+        'predicted' decrease (S=S_bar, U=U_bar, R=lin.R_bar, f_true=lin.f_val,
+        h_true=lin.h_sdf -- all exact AT the anchor, since a Taylor expansion is
+        exact at its own expansion point) and the 'actual' decrease (S=Xs,
+        U=Us, R/f_true/h_true freshly recomputed) that the rho ratio test
+        compares."""
         svp = self.svp
         effort = svp.w_u * float(np.sum(svp.r_v * U[:, 0] ** 2 + svp.r_omega * U[:, 1] ** 2))
         risk = self.cfg.risk.w_risk * float(sum(cvar(R[k], self.cfg.risk.alpha)
                                                  for k in range(R.shape[0])))
         term = svp.w_term * float(np.sum(np.abs(S[-1] - s_goal)))
         arc = svp.w_arc * float(np.sum((S[1:, 0:2] - S[:-1, 0:2]) ** 2))
+        defect = svp.w_nu * float(np.sum(np.abs(_wrap_defect(f_true - S[1:]))))
         # one-sided (relu, not abs): extra clearance beyond d_safe isn't penalized,
         # only a genuine deficit is -- matches the QP's own sigma at its optimum
         # (for a fixed candidate, optimal sigma = max(0, d_safe - h) exactly).
         sdf_slack = svp.w_sdf * float(np.sum(np.maximum(0.0, svp.d_safe - h_true)))
-        return effort + risk + term + arc + sdf_slack
+        return effort + risk + term + arc + defect + sdf_slack
 
     # ---- build the CVXPY problem ONCE per (K, M) shape ----------------------
     def _build_qp(self, K, M):
@@ -465,6 +463,8 @@ class RiskAwareSCP:
         u = cp.Variable((K, NU))
         tau = cp.Variable(K)
         eta = cp.Variable((K, M), nonneg=True)
+        nu_p = cp.Variable((K, NX), nonneg=True)
+        nu_m = cp.Variable((K, NX), nonneg=True)
         sTp = cp.Variable(NX, nonneg=True)
         sTm = cp.Variable(NX, nonneg=True)
         sigma = cp.Variable(K + 1, nonneg=True)
@@ -490,38 +490,35 @@ class RiskAwareSCP:
         cvar = self.cfg.risk.w_risk * (cp.sum(tau)
                                         + (1.0 / (self.cfg.risk.alpha * M)) * cp.sum(eta))
         term = svp.w_term * cp.sum(sTp + sTm)
-        # SDF-slack exact penalty (Constraint III's own virtual buffer -- the
-        # only exact-penalty slack left in the linearized constraint set now
-        # that Constraint II is a hard equality; see SCPVelParams.w_sdf).
+        vc = svp.w_nu * cp.sum(nu_p + nu_m)
+        # SDF-slack exact penalty (Constraint III's own virtual buffer, mirroring
+        # nu_p/nu_m for Constraint II -- see SCPVelParams.w_sdf).
         vc_sdf = svp.w_sdf * cp.sum(sigma)
         # arc-length penalty: pure Variable quadratic (no Parameters involved), so
         # it's trivially DPP-compliant on its own -- pulls consecutive knots toward
         # the shortest evenly-spaced path, countering the fact that nothing else in
         # this objective penalizes path length (see RiskAwareSCP module docstring).
         arc = svp.w_arc * cp.sum_squares(s[1:, 0:2] - s[:-1, 0:2])
-        objective = cp.Minimize(effort + cvar + term + vc_sdf + arc)
+        objective = cp.Minimize(effort + cvar + term + vc + vc_sdf + arc)
 
         cons = []
         # I. boundary
         cons += [s[0] == sstart_p]
         cons += [s[K] == sgoal_p + sTp - sTm]
-        # II. linearized dynamics, HARD equality (no virtual control -- per
-        # edge, a DIFFERENT A_k/B_k matrix per k, so this can't be vectorized
-        # without a loop; matches scp.py's own per-knot constraint-building
-        # pattern). With no slack to absorb a bad linearization, the QP itself
-        # goes infeasible if no point in the trust box satisfies this exactly
-        # -- caught by the outer loop's INFEASIBLE branch (grow trust, retry).
+        # II. linearized dynamics + virtual control (per edge -- a DIFFERENT
+        # A_k/B_k matrix per k, so this can't be vectorized without a loop;
+        # matches scp.py's own per-knot constraint-building pattern)
         for k in range(K):
-            cons += [s[k + 1] == dconst_p[k] + A_p[k] @ s[k] + B_p[k] @ u[k]]
+            cons += [s[k + 1] == dconst_p[k] + A_p[k] @ s[k] + B_p[k] @ u[k]
+                     + nu_p[k] - nu_m[k]]
         # III. SDF collision keep-out, vectorized over all K+1 knots at once
         # (elementwise Parameter*Variable, no per-k matrix -- no loop needed).
         # sigma (nonneg, exact-penalty via vc_sdf above) is this constraint's own
         # virtual buffer -- WITHOUT it, the zero-step point (s=S_bar) is only
         # feasible here if the anchor's true clearance already met d_safe, which
-        # isn't guaranteed (a linearization remainder on this constraint).
-        # Constraint II no longer has an analogous cushion (hard equality), so
-        # sigma is the only slack left of this kind: a prior accepted iterate
-        # can satisfy the OLD linearized SDF constraint without truly
+        # isn't guaranteed (a linearization remainder on this constraint, exactly
+        # analogous to why Constraint II needs nu_p/nu_m): a prior accepted
+        # iterate can satisfy the OLD linearized SDF constraint without truly
         # satisfying h(Xs) >= d_safe, so next iteration's zero-step check can
         # otherwise be outright QP-infeasible.
         cons += [cp.sum(cp.multiply(gh_p, s[:, 0:2]), axis=1) >= sdfrhs_p - sigma]
@@ -561,7 +558,7 @@ class RiskAwareSCP:
         assert prob.is_dpp(), "QP is not DPP-compliant -- re-solves would re-canonicalize"
 
         self.s, self.u, self.tau, self.eta = s, u, tau, eta
-        self.sTp, self.sTm = sTp, sTm
+        self.nu_p, self.nu_m, self.sTp, self.sTm = nu_p, nu_m, sTp, sTm
         self.sigma = sigma
         self._A_p, self._B_p, self._dconst_p = A_p, B_p, dconst_p
         self._Gs_p, self._Gu_p, self._Rconst_p = Gs_p, Gu_p, Rconst_p
@@ -650,14 +647,14 @@ class RiskAwareSCP:
         move_scale = np.array([1.0, 1.0, 1.0, u_max[0], u_max[1]])
 
         iters = 0; error = np.inf; n_solves = 0; hist = []
-        n_defect_rejects = 0; defect_true = 0.0; final_defect = 0.0
+        n_defect_rejects = 0; defect_true = 0.0; defect_qp = 0.0; final_defect = 0.0
         n_rho_rejects = 0; rho = 1.0
         stop_reason = None; cost_converged = False; consecutive_grows = 0
         # hard backstop, independent of `iters` (which only counts ACCEPTED steps --
         # a run that never accepts anything, e.g. a trust-value cycle between an
         # infeasible solve and a defect/rho reject, would otherwise spin forever):
         # cap total solve attempts generously above what any healthy run needs.
-        max_solves = 1 * self.svp.max_iters
+        max_solves = 20 * self.svp.max_iters
         while (iters < self.svp.max_iters and error >= self.svp.tol_step
                and not cost_converged and n_solves < max_solves):
             lin = self._linearize(S_bar, U_bar, nsteps_k)
@@ -697,21 +694,22 @@ class RiskAwareSCP:
             Us = np.clip(np.array(self.u.value), u_min, u_max)
 
             # TRUE dynamics-defect residual at the candidate -- f_edge(Xs[:-1],Us)
-            # recomputed FRESH via EdgeJacobianEvaluator.batch_jacobians (self-
-            # referential otherwise: any point the QP outputs satisfies its own
-            # hard linearized equality by construction, whether or not it's
-            # consistent with the real dynamics -- this is exactly what let a
-            # run get permanently stuck rejecting with a defect that GREW as
-            # trust shrank, which only makes sense if the inconsistency was
-            # baked into the anchor's own knots).
+            # recomputed FRESH via EdgeJacobianEvaluator.batch_jacobians, never the
+            # QP's own nu_p/nu_m (self-referential: any point the QP outputs looks
+            # consistent with the stale linearization that produced it, whether or
+            # not it's consistent with the real dynamics -- this is exactly what let
+            # a run get permanently stuck rejecting with a defect that GREW as trust
+            # shrank, which only makes sense if the inconsistency was baked into the
+            # anchor's own knots). defect_qp is kept purely as a logged diagnostic --
+            # the gap between it and defect_true is a free curvature probe.
             _, _, f_true = self.jac_eval.batch_jacobians(Xs[:-1], Us, nsteps_k)
             resid = _wrap_defect(f_true - Xs[1:])
             defect_true = float(np.max(np.abs(resid)))
+            defect_qp = float(np.max(np.asarray(self.nu_p.value) + np.asarray(self.nu_m.value)))
             # TRUE sdf value at the candidate -- fresh env.sdf_and_grad call, never
-            # the QP's own sigma (same self-referential concern as above, one
-            # constraint over: Constraint III has no guarantee analogous to
-            # "zero-step is feasible" without this, see _build_qp's Constraint
-            # III comment).
+            # the QP's own sigma (same self-referential concern as nu, one constraint
+            # over: Constraint III has no guarantee analogous to "zero-step is
+            # feasible" without this, see _build_qp's Constraint III comment).
             h_true, _ = self.env.sdf_and_grad(Xs[:, 0:2])
 
             # non-worsening defect gate: reject only if the candidate is MEANINGFULLY
@@ -738,7 +736,7 @@ class RiskAwareSCP:
                     trust_s, trust_u, anchor_defect, consecutive_grows)
                 if verbose:
                     print(f"  SCP it {iters:2d}: REJECTED (defect_true={defect_true:.2e} "
-                          f"> anchor={anchor_defect:.2e}+margin), "
+                          f"> anchor={anchor_defect:.2e}+margin, qp_nu={defect_qp:.2e}), "
                           f"trust_s -> {trust_s.max():.3f}")
                 # give up only once the trust update (grow OR shrink -- whichever
                 # _reject_trust_step picked) genuinely changes nothing (already fully
@@ -760,16 +758,14 @@ class RiskAwareSCP:
             # both exact AT the anchor (a Taylor expansion is exact at its own
             # expansion point), so J_anchor is the true cost of the current anchor,
             # not an approximation -- and prob.value is the QP's own predicted new
-            # cost. J_candidate recomputes risk (edge_risk, value only) HONESTLY at
-            # (Xs, Us) instead of trusting the QP's linear g_s/g_u estimate, so
+            # cost. J_candidate recomputes risk (edge_risk, value only) AND the
+            # dynamics defect (f_true, already computed above) HONESTLY at (Xs, Us)
+            # instead of trusting the QP's linear g_s/g_u estimate or its own nu, so
             # pred_decrease and act_decrease are on equal footing except for exactly
-            # the one thing that was ever approximated: risk (SDF-slack too, in
-            # principle, but sigma's own exact-penalty structure keeps that exact
-            # at the optimum). Dynamics defect deliberately does NOT feed either
-            # side of this comparison -- see _true_cost's docstring.
-            J_anchor = self._true_cost(S_bar, U_bar, lin.R_bar, lin.h_sdf, s_goal)
+            # the two things that were ever approximated: risk and defect.
+            J_anchor = self._true_cost(S_bar, U_bar, lin.R_bar, lin.f_val, lin.h_sdf, s_goal)
             R_true = self.risk_eval.edge_risk(Xs[:-1], Us, nsteps_k)
-            J_candidate = self._true_cost(Xs, Us, R_true, h_true, s_goal)
+            J_candidate = self._true_cost(Xs, Us, R_true, f_true, h_true, s_goal)
             pred_decrease = J_anchor - float(self.prob.value)
             act_decrease = J_anchor - J_candidate
             # pred_decrease is NOT guaranteed positive: the zero-step point (s=S_bar,
@@ -797,8 +793,7 @@ class RiskAwareSCP:
                     trust_s, trust_u, anchor_defect, consecutive_grows)
                 if verbose:
                     print(f"  SCP it {iters:2d}: REJECTED (rho={rho:.3f} < "
-                          f"rho_accept={self.svp.rho_accept}, defect_true={defect_true:.2e}), "
-                          f"trust_s -> {trust_s.max():.3f}")
+                          f"rho_accept={self.svp.rho_accept}), trust_s -> {trust_s.max():.3f}")
                 # see the analogous comment in the defect-reject branch above.
                 if np.array_equal(trust_s, trust_s_old):
                     if verbose:
@@ -810,18 +805,17 @@ class RiskAwareSCP:
             # accept: advance the anchor, reset the futility-grow counter, and adopt
             # this candidate's own true defect as the new anchor's consistency.
             # Great agreement (rho >= rho_good) grows trust for bigger future
-            # strides -- but only if the true defect is also small; a large true
-            # defect means high local curvature (a direct probe of it), so even a
+            # strides -- but only if the true-vs-linear defect gap is also small; a
+            # large gap means high local curvature (a direct probe of it), so even a
             # great-rho step shouldn't compound trust on top of that region.
-            # Acceptable-but-not-great agreement (or a great rho with a large
-            # defect) leaves trust unchanged -- only a poor-rho/defect reject
-            # shrinks it now.
+            # Acceptable-but-not-great agreement (or a great rho with a large gap)
+            # leaves trust unchanged -- only a poor-rho/defect reject shrinks it now.
             error = float(np.max(np.linalg.norm((Xs - S_bar) / move_scale, axis=1)))
             S_bar, U_bar = Xs, Us
             final_defect = defect_true
             consecutive_grows = 0
             if (rho >= self.svp.rho_good
-                    and defect_true <= self._GROWTH_GAP_MULT * self.svp.tol_defect):
+                    and (defect_true - defect_qp) <= self._GROWTH_GAP_MULT * self.svp.tol_defect):
                 trust_s = np.minimum(trust_s * self.svp.tr_grow, self.svp.tr_max)
                 trust_u = np.minimum(trust_u * self.svp.tr_grow, self.svp.tr_max)
             iters += 1
@@ -848,7 +842,8 @@ class RiskAwareSCP:
             if verbose:
                 print(f"  SCP it {iters:2d}: max_move={error:.4f}  "
                       f"trust_s={trust_s.max():.3f}  cost={J_candidate:.4f}  "
-                      f"defect_true={defect_true:.2e}  rho={rho:.3f}")
+                      f"defect_true={defect_true:.2e}  defect_qp={defect_qp:.2e}  "
+                      f"rho={rho:.3f}")
         else:
             if error < self.svp.tol_step:
                 stop_reason = "tol_step"
@@ -869,7 +864,7 @@ class RiskAwareSCP:
                 "stop_reason": stop_reason,
                 "cost_history": hist,
                 "final_defect": final_defect,
-                "max_defect": defect_true,
+                "max_defect": defect_true, "defect_qp": defect_qp,
                 "n_defect_rejects": n_defect_rejects,
                 "rho": rho, "n_rho_rejects": n_rho_rejects}
         return S_bar, U_bar, info

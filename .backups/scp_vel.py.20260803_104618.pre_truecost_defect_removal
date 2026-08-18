@@ -423,38 +423,41 @@ class RiskAwareSCP:
         return LinData(R_bar, g_s, g_u, A, B, f_val, h_sdf, grad_h)
 
     # ---- exact (non-linearized) objective value, for the rho ratio test ----
-    def _true_cost(self, S, U, R, h_true, s_goal):
-        """effort + CVaR(risk) + terminal-L1 + arc-length + SDF-slack,
-        evaluated EXACTLY at (S, U) -- same weights/formula as _build_qp's
-        objective, term for term, computed directly in numpy instead of
-        through CVXPY. No dynamics-defect term: Constraint II is a hard
-        equality with no QP-side counterpart to compare it against (see
-        below), so folding a defect penalty in here would bias pred_decrease
-        against act_decrease -- dynamics consistency is policed separately,
-        by the defect gate (anchor_defect/defect_true) in solve(), not by
-        this cost/the rho test. R (K,M) must be the TRUE edge risk at (S, U)
-        (risk_eval.edge_risk, no gradient/linearization); h_true (K+1,) must
-        be the TRUE sdf value at every knot (env.sdf_and_grad's 1st return
-        value) -- NOT the QP's own sigma, which measures consistency against
-        the stale linearization that produced a candidate, not reality.
-        effort/term/arc are already exact functions of (S, U) even inside the
-        QP, so only risk/SDF-slack can differ between the linear surrogate
-        and the true cost. Used to compute both the
-        'predicted' decrease (S=S_bar, U=U_bar, R=lin.R_bar, h_true=lin.h_sdf
-        -- all exact AT the anchor, since a Taylor expansion is exact at its
-        own expansion point) and the 'actual' decrease (S=Xs, U=Us,
-        R/h_true freshly recomputed) that the rho ratio test compares."""
+    def _true_cost(self, S, U, R, f_true, h_true, s_goal):
+        """effort + CVaR(risk) + terminal-L1 + arc-length + dynamics-defect +
+        SDF-slack, evaluated EXACTLY at (S, U) -- same weights/formula as
+        _build_qp's objective for every term EXCEPT dynamics-defect, which
+        has no QP-side counterpart anymore (Constraint II is a hard equality,
+        no virtual control) -- but computed directly in numpy instead of
+        through CVXPY. R (K,M) must be the TRUE edge risk at (S, U)
+        (risk_eval.edge_risk, no gradient/linearization); f_true (K,NX) must
+        be the TRUE f_edge(s_k,u_k) for every edge (EdgeJacobianEvaluator.
+        batch_jacobians' 3rd return value); h_true (K+1,) must be the TRUE sdf
+        value at every knot (env.sdf_and_grad's 1st return value) -- NOT the
+        QP's own sigma. Both f_true and h_true measure consistency against the
+        real model/environment, never against the stale linearization that
+        produced a candidate. effort/term/arc are already exact functions of
+        (S, U) even inside the QP, so only risk/SDF-slack can differ between
+        the linear surrogate and the true cost; defect is never in the QP
+        surrogate at all, so it contributes here unconditionally. Used to
+        compute both the
+        'predicted' decrease (S=S_bar, U=U_bar, R=lin.R_bar, f_true=lin.f_val,
+        h_true=lin.h_sdf -- all exact AT the anchor, since a Taylor expansion is
+        exact at its own expansion point) and the 'actual' decrease (S=Xs,
+        U=Us, R/f_true/h_true freshly recomputed) that the rho ratio test
+        compares."""
         svp = self.svp
         effort = svp.w_u * float(np.sum(svp.r_v * U[:, 0] ** 2 + svp.r_omega * U[:, 1] ** 2))
         risk = self.cfg.risk.w_risk * float(sum(cvar(R[k], self.cfg.risk.alpha)
                                                  for k in range(R.shape[0])))
         term = svp.w_term * float(np.sum(np.abs(S[-1] - s_goal)))
         arc = svp.w_arc * float(np.sum((S[1:, 0:2] - S[:-1, 0:2]) ** 2))
+        defect = svp.w_nu * float(np.sum(np.abs(_wrap_defect(f_true - S[1:]))))
         # one-sided (relu, not abs): extra clearance beyond d_safe isn't penalized,
         # only a genuine deficit is -- matches the QP's own sigma at its optimum
         # (for a fixed candidate, optimal sigma = max(0, d_safe - h) exactly).
         sdf_slack = svp.w_sdf * float(np.sum(np.maximum(0.0, svp.d_safe - h_true)))
-        return effort + risk + term + arc + sdf_slack
+        return effort + risk + term + arc + defect + sdf_slack
 
     # ---- build the CVXPY problem ONCE per (K, M) shape ----------------------
     def _build_qp(self, K, M):
@@ -657,7 +660,7 @@ class RiskAwareSCP:
         # a run that never accepts anything, e.g. a trust-value cycle between an
         # infeasible solve and a defect/rho reject, would otherwise spin forever):
         # cap total solve attempts generously above what any healthy run needs.
-        max_solves = 1 * self.svp.max_iters
+        max_solves = 20 * self.svp.max_iters
         while (iters < self.svp.max_iters and error >= self.svp.tol_step
                and not cost_converged and n_solves < max_solves):
             lin = self._linearize(S_bar, U_bar, nsteps_k)
@@ -760,16 +763,14 @@ class RiskAwareSCP:
             # both exact AT the anchor (a Taylor expansion is exact at its own
             # expansion point), so J_anchor is the true cost of the current anchor,
             # not an approximation -- and prob.value is the QP's own predicted new
-            # cost. J_candidate recomputes risk (edge_risk, value only) HONESTLY at
-            # (Xs, Us) instead of trusting the QP's linear g_s/g_u estimate, so
+            # cost. J_candidate recomputes risk (edge_risk, value only) AND the
+            # dynamics defect (f_true, already computed above) HONESTLY at (Xs, Us)
+            # instead of trusting the QP's linear g_s/g_u estimate or its own nu, so
             # pred_decrease and act_decrease are on equal footing except for exactly
-            # the one thing that was ever approximated: risk (SDF-slack too, in
-            # principle, but sigma's own exact-penalty structure keeps that exact
-            # at the optimum). Dynamics defect deliberately does NOT feed either
-            # side of this comparison -- see _true_cost's docstring.
-            J_anchor = self._true_cost(S_bar, U_bar, lin.R_bar, lin.h_sdf, s_goal)
+            # the two things that were ever approximated: risk and defect.
+            J_anchor = self._true_cost(S_bar, U_bar, lin.R_bar, lin.f_val, lin.h_sdf, s_goal)
             R_true = self.risk_eval.edge_risk(Xs[:-1], Us, nsteps_k)
-            J_candidate = self._true_cost(Xs, Us, R_true, h_true, s_goal)
+            J_candidate = self._true_cost(Xs, Us, R_true, f_true, h_true, s_goal)
             pred_decrease = J_anchor - float(self.prob.value)
             act_decrease = J_anchor - J_candidate
             # pred_decrease is NOT guaranteed positive: the zero-step point (s=S_bar,
@@ -797,8 +798,7 @@ class RiskAwareSCP:
                     trust_s, trust_u, anchor_defect, consecutive_grows)
                 if verbose:
                     print(f"  SCP it {iters:2d}: REJECTED (rho={rho:.3f} < "
-                          f"rho_accept={self.svp.rho_accept}, defect_true={defect_true:.2e}), "
-                          f"trust_s -> {trust_s.max():.3f}")
+                          f"rho_accept={self.svp.rho_accept}), trust_s -> {trust_s.max():.3f}")
                 # see the analogous comment in the defect-reject branch above.
                 if np.array_equal(trust_s, trust_s_old):
                     if verbose:
